@@ -28,7 +28,7 @@ import sys
 
 import numpy as np
 
-from stl_tools import add_define_option, load_mesh
+from stl_tools import add_define_option, load_mesh, parse_define
 
 AXES = "xyz"
 NUDGE = 1e-6
@@ -84,8 +84,23 @@ def group_coplanar(triangles, normals, areas, normal_tol=2e-3, offset_tol=0.02):
     return group
 
 
+# (u, v) for the six axis-aligned normals, world-axis-aligned so e.g. a +Z face's
+# points_2d reads directly as (x, y). v always equals cross(normal, u) (see in_plane_basis).
+_AXIS_FRAMES = {
+    (0, 0, 1): (np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0])),
+    (0, 0, -1): (np.array([1.0, 0.0, 0.0]), np.array([0.0, -1.0, 0.0])),
+    (1, 0, 0): (np.array([0.0, 1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+    (-1, 0, 0): (np.array([0.0, -1.0, 0.0]), np.array([0.0, 0.0, 1.0])),
+    (0, 1, 0): (np.array([0.0, 0.0, 1.0]), np.array([1.0, 0.0, 0.0])),
+    (0, -1, 0): (np.array([0.0, 0.0, 1.0]), np.array([-1.0, 0.0, 0.0])),
+}
+
+
 def in_plane_basis(normal):
-    # right-handed (u, v, normal): loops wound CCW around the normal have positive 2D area
+    # right-handed (u, v, normal): loops wound CCW around the normal have positive 2D area.
+    key = (int(round(normal[0])), int(round(normal[1])), int(round(normal[2])))
+    if key in _AXIS_FRAMES:
+        return _AXIS_FRAMES[key]
     helper = np.array([0.0, 0.0, 1.0]) if abs(normal[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
     u = np.cross(normal, helper)
     u /= np.linalg.norm(u)
@@ -111,6 +126,9 @@ def boundary_loops(tri_vert_ids):
             while current != start and outgoing.get(current):
                 loop.append(current)
                 current = outgoing[current].pop()
+            if current != start:
+                print(f"warning: open boundary loop ({len(loop)} points) - mesh is not "
+                      f"watertight here", file=sys.stderr)
             loops.append(loop)
     return loops
 
@@ -122,8 +140,16 @@ def polygon_area_2d(points):
 
 
 def extract_faces(triangles, decimals=4):
-    vertices, tri_vert_ids = dedupe_vertices(triangles, decimals)
     normals, areas = face_normals_and_areas(triangles)
+    degenerate = areas <= 1e-9
+    if degenerate.any():
+        # a zero-area sliver would otherwise form its own group with a zero/NaN normal
+        # and crash the weighted average below (weights summing to zero)
+        print(f"warning: dropping {int(degenerate.sum())} degenerate (zero-area) "
+              f"triangle(s)", file=sys.stderr)
+        triangles, normals, areas = triangles[~degenerate], normals[~degenerate], areas[~degenerate]
+
+    vertices, tri_vert_ids = dedupe_vertices(triangles, decimals)
     group_ids = group_coplanar(triangles, normals, areas)
 
     faces = []
@@ -156,6 +182,8 @@ def extract_faces(triangles, decimals=4):
             "area": rnd(areas[mask].sum(), decimals),
             "triangle_count": int(mask.sum()),
             "bounding_box": bbox(pts, decimals),
+            # points_2d = origin + u*p[0] + v*p[1] in model coordinates
+            "frame": {"origin": rnd(origin, decimals), "u": rnd(u, decimals), "v": rnd(v, decimals)},
             "loops": loops,
         })
 
@@ -198,6 +226,13 @@ def parse_xyz(text):
     if len(values) != 3:
         raise argparse.ArgumentTypeError("--shift needs 3 values: X,Y,Z")
     return np.array(values)
+
+
+def parse_profile_axis(text):
+    text = text.strip().lower()
+    if text not in AXES:
+        raise argparse.ArgumentTypeError(f"--profile expects x, y or z, got {text!r}")
+    return AXES.index(text)
 
 
 def nudge(value, coords, label):
@@ -364,7 +399,7 @@ def add_section_options(parser):
     parser.add_argument("--scan", type=parse_axis_values, default=None, metavar="AXIS=V1[,V2...]",
                         help="scan lines inside each cut, e.g. Z=-13,-11; reports material intervals "
                              "along the remaining axis")
-    parser.add_argument("--profile", type=lambda s: AXES.index(s.lower()), default=None, metavar="AXIS",
+    parser.add_argument("--profile", type=parse_profile_axis, default=None, metavar="AXIS",
                         help="report peaks/troughs of the low and high boundary along AXIS "
                              "(e.g. X) as a function of the remaining in-plane axis")
     parser.add_argument("--prominence", type=float, default=0.2,
@@ -404,21 +439,29 @@ def compare_main(argv):
     parser.add_argument("a", type=pathlib.Path)
     parser.add_argument("b", type=pathlib.Path)
     parser.add_argument("--mirror-x", action="store_true", help="mirror B in X (x -> -x) before shifting")
-    parser.add_argument("--normal-tol", type=float, default=2e-3, help="normal grouping tolerance")
+    parser.add_argument("--normal-tol", type=float, default=2e-3,
+                        help="per-component normal grouping tolerance for area_by_normal (default 0.002)")
     parser.add_argument("--cut", type=parse_axis_values, default=None, metavar="AXIS=V1[,V2...]",
                         help="also compare sections at these planes (see section --help)")
     parser.add_argument("--scan", type=parse_axis_values, default=None, metavar="AXIS=V1[,V2...]")
-    parser.add_argument("--profile", type=lambda s: AXES.index(s.lower()), default=None, metavar="AXIS")
+    parser.add_argument("--profile", type=parse_profile_axis, default=None, metavar="AXIS")
     parser.add_argument("--prominence", type=float, default=0.2)
     parser.add_argument("--shift", type=parse_xyz, default=None, metavar="X,Y,Z", help="translate B by this")
     parser.add_argument("--decimals", type=int, default=4, help="output rounding")
+    parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
     add_define_option(parser)
+    parser.add_argument(
+        "--define-b", "-Db", action="append", default=[], type=parse_define, metavar="NAME=VALUE",
+        help="extra OpenSCAD variable override for B only, applied after --define "
+             "(e.g. compare one .scad against itself under a different -D)",
+    )
     args = parser.parse_args(argv)
     dec = args.decimals
 
     meshes = {
         "a": load_mesh(args.a, pathlib.Path.cwd(), args.define),
-        "b": transformed(load_mesh(args.b, pathlib.Path.cwd(), args.define), args.shift, args.mirror_x),
+        "b": transformed(load_mesh(args.b, pathlib.Path.cwd(), args.define + args.define_b),
+                          args.shift, args.mirror_x),
     }
     result = {"a": str(args.a), "b": str(args.b)}
     for key, tris in meshes.items():
@@ -450,7 +493,7 @@ def compare_main(argv):
                               "b_minus_a": rnd(ib - ia, dec) if len(ia) == len(ib) else None})
             entry["scan_diffs"] = diffs
             result["sections"].append(entry)
-    write_json(result, None)
+    write_json(result, args.out)
 
 
 # ---- faces (default) -------------------------------------------------------
@@ -460,11 +503,16 @@ def faces_main(argv):
     parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export with openscad first")
     parser.add_argument("--decimals", type=int, default=4, help="rounding used to merge vertices and in output")
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
+    parser.add_argument("--min-area", type=float, default=None,
+                        help="drop faces smaller than this area (mm^2), e.g. to skip small holes "
+                             "when the full output is too large to read in one go")
     add_define_option(parser)
     args = parser.parse_args(argv)
 
     triangles = load_mesh(args.stl, pathlib.Path.cwd(), args.define)
     faces = extract_faces(triangles, args.decimals)
+    if args.min_area is not None:
+        faces = [f for f in faces if f["area"] >= args.min_area]
 
     result = {
         "source": str(args.stl),

@@ -6,7 +6,7 @@
 #   "pillow",
 # ]
 # ///
-"""Render DeskDrawer_Body_v12.stl from many angles, one color per surface.
+"""Render an STL (or OpenSCAD) model from many angles, one color per surface.
 
 For each rotation axis (elevation, azimuth, roll) sweeps in --step
 increments over 0-360 degrees, producing one PNG per angle. Each planar
@@ -17,6 +17,7 @@ algorithm, which can show occluded faces through nearer ones). Meant to
 be fed to a vision model (e.g. Haiku) to inspect the model from many sides.
 """
 import argparse
+import itertools
 import pathlib
 import sys
 
@@ -67,9 +68,13 @@ def camera_basis(elev, azim, roll):
     world_up = np.array([0.0, 0.0, 1.0])
     if abs(np.dot(forward, world_up)) > 0.999:
         world_up = np.array([0.0, 1.0, 0.0])
-    right = np.cross(forward, world_up)
+    # right = cross(world_up, forward), not cross(forward, world_up): forward here points
+    # from the scene toward the camera (see depth below), and swapping the cross-product
+    # order mirrors every image left-right (verified: a camera on +Y facing the origin
+    # must see -X, i.e. world West, on its right; the swapped order gave +X instead).
+    right = np.cross(world_up, forward)
     right /= np.linalg.norm(right)
-    up = np.cross(right, forward)
+    up = np.cross(forward, right)
 
     # rotate right/up around the view axis (forward) by roll, via Rodrigues' formula
     axis = forward
@@ -87,17 +92,22 @@ def camera_basis(elev, azim, roll):
     return forward, right, up
 
 
-def rasterize(triangles, colors, elev, azim, roll, imgsize):
+def rasterize(triangles, colors, elev, azim, roll, imgsize, frame_points=None):
     forward, right, up = camera_basis(elev, azim, roll)
-    center = triangles.reshape(-1, 3).mean(axis=0)
+    # frame_points (e.g. a --focus box's corners) sets the camera framing independently of
+    # which triangles get drawn, so one oversized triangle pulled in by --focus (its centroid
+    # falls in the box, but a vertex may sit far outside it) can't force the camera to zoom out.
+    frame_points = triangles.reshape(-1, 3) if frame_points is None else frame_points
+    center = frame_points.mean(axis=0)
     rel = triangles - center
+    frame_rel = frame_points - center
 
     x = rel @ right
     y = rel @ up
     depth = rel @ forward  # larger = nearer camera
 
     margin = 1.1
-    half_extent = max(np.abs(x).max(), np.abs(y).max()) * margin
+    half_extent = max(np.abs(frame_rel @ right).max(), np.abs(frame_rel @ up).max()) * margin
     scale = (imgsize / 2) / half_extent
     px = (x * scale + imgsize / 2)
     py = (imgsize / 2 - y * scale)
@@ -151,7 +161,7 @@ def main():
     parser.add_argument(
         "--focus", type=parse_box, default=None, metavar="XMIN,XMAX,YMIN,YMAX,ZMIN,ZMAX",
         help="render only triangles whose centre is inside this box (STL coordinates); "
-             "the camera frames just those triangles",
+             "the camera frames the box itself",
     )
     add_define_option(parser)
     args = parser.parse_args()
@@ -162,11 +172,16 @@ def main():
     if args.out is None:
         args.out = args.stl.parent / f".stl-renders-{args.stl.stem}"
     args.out.mkdir(parents=True, exist_ok=True)
+    for old in args.out.glob("*.png"):  # drop stale images from a previous run (e.g. different --step/--focus)
+        old.unlink()
 
     triangles = load_mesh(args.stl, args.out, args.define)
+    frame_points = None
     if args.focus is not None:
         triangles = focus_triangles(triangles, args.focus)
         print(f"focused on {len(triangles)} triangles")
+        xmin, xmax, ymin, ymax, zmin, zmax = args.focus
+        frame_points = np.array(list(itertools.product((xmin, xmax), (ymin, ymax), (zmin, zmax))))
     colors = face_colors(triangles)
 
     angles = range(0, 360, args.step)
@@ -180,7 +195,7 @@ def main():
 
     for name, elev, azim, roll in jobs:
         out_path = args.out / f"{name}.png"
-        buf = rasterize(triangles, colors, elev, azim, roll, args.imgsize)
+        buf = rasterize(triangles, colors, elev, azim, roll, args.imgsize, frame_points)
         Image.fromarray(buf, "RGB").save(out_path)
         print(out_path)
 

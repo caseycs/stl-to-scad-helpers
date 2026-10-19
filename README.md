@@ -1,10 +1,10 @@
-# stl-to-scad-heplers
+# stl-to-scad-helpers
 
 Tools for an LLM to inspect an STL (or OpenSCAD) model when replicating or
 editing it in OpenSCAD:
 
 - **`render_views.py`** renders the model from many camera angles into PNGs,
-  one color per surface, for a vision model to eyeball from all sides.
+  one color per surface orientation, for a vision model to eyeball from all sides.
 - **`extract_geometry.py`** extracts exact planar-face geometry (normals,
   dimensions, boundary polygons) as JSON. A vision model can't read exact
   dimensions off a picture, so use this for replicating precise measurements

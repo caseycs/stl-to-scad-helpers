@@ -15,7 +15,15 @@ STL_RECORD = np.dtype([
 
 def load_binary_stl(path):
     data = pathlib.Path(path).read_bytes()
+    if len(data) < 84:
+        sys.exit(f"{path}: too small to be a binary STL ({len(data)} bytes)")
     count = int(np.frombuffer(data, "<u4", 1, 80)[0])
+    expected = 84 + 50 * count
+    if len(data) != expected:
+        hint = (" (looks like an ASCII STL - export/convert to binary first, "
+                 "e.g. `openscad --export-format binstl`)" if data[:5] == b"solid" else "")
+        sys.exit(f"{path}: not a binary STL (expected {expected} bytes for {count} "
+                  f"triangles, got {len(data)}){hint}")
     records = np.frombuffer(data, STL_RECORD, count, 84)
     return records["v"].astype(np.float64)
 
@@ -52,5 +60,7 @@ def load_mesh(path, scad_out_dir, defines=()):
     if not path.exists():
         sys.exit(f"missing {path}")
     if path.suffix == ".scad":
-        path = export_scad_to_stl(path, pathlib.Path(scad_out_dir) / f"{path.stem}.stl", defines)
+        # distinct suffix so this never silently overwrites a real same-named .stl
+        out = pathlib.Path(scad_out_dir) / f"{path.stem}.scad-export.stl"
+        path = export_scad_to_stl(path, out, defines)
     return load_binary_stl(path)
