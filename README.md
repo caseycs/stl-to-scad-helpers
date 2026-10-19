@@ -13,12 +13,17 @@ editing it in OpenSCAD:
 Both accept a `.scad` file too: it's exported to binary STL first via the
 `openscad` CLI (must be on `PATH`).
 
+| Full model | Zoomed on one feature (`--focus`) |
+| --- | --- |
+| ![full model, one color per surface](docs/images/example-iso.png) | ![zoomed on the handle](docs/images/example-focus-handle.png) |
+
 Each script is a [PEP 723](https://peps.python.org/pep-0723/) single-file
 script with its dependencies declared inline — run with `uv run`, no
 virtualenv setup needed.
 
 ```
 uv run render_views.py model.stl --step 30
+uv run render_views.py model.stl --focus=-36,36,-223,-206.65,6.5,23  # zoom on one feature
 uv run extract_geometry.py model.scad --out geometry.json
 ```
 
