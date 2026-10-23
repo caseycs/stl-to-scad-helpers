@@ -137,6 +137,41 @@ reports:
   `"at": [pos_from, pos_to]` when the peak/trough is a flat plateau rather
   than a single point.
 
+### `slice` subcommand
+
+```
+extract_geometry.py slice FILE --origin X,Y,Z --normal NX,NY,NZ [--u UX,UY,UZ] [--window UMIN,UMAX,VMIN,VMAX [--within]] [--scad] [--svg cut.svg] [--out file.json]
+```
+
+Cuts the mesh with any plane and returns the cross-section as vector
+geometry: closed loops (or, with a clipping window, open chains) of `line`,
+`arc` and `circle` items, in the plane's own 2D coordinates.
+
+- Frame: `--origin` becomes `(0, 0)`; `u` is `--u` projected onto the plane
+  (default: the same frame `extract_geometry.py` uses for faces) and
+  `v = normal × u`, so `(u, v, normal)` is right-handed. The output `frame`
+  maps a point `(p, q)` back to `origin + u*p + v*q`. For a vertical cut,
+  pick the normal's sign so `v` comes out as `+Z` (e.g. `--normal -1,-1,0
+  --u 1,-1,0`); flipping the normal mirrors `v`.
+- Winding: outer loops run counter-clockwise, holes clockwise, seen from the
+  normal side — the same convention OpenSCAD's `polygon()` paths use.
+- `--window`: clip the cut to a `(u, v)` box. Plan cuts of a plate are one
+  huge outer loop, so clipping is how you zoom on a single feature; loops
+  crossing the box edge become `"kind": "open"` chains. `--within` instead
+  keeps only whole loops lying entirely inside the box, unclipped.
+- Simplification: Douglas-Peucker with `--tol` (default 0.002 mm) removes
+  collinear mesh vertices, then runs of at least `--min-arc-points` points
+  that fit one circle within `--arc-tol` (default 0.005 mm) become an `arc`
+  (`center`, `radius`, `start_deg`, `end_deg`, `ccw`); a whole loop on one
+  circle is a single `circle`. Curves that aren't circular (e.g. a thread
+  flank cut at an angle) come out as several short arcs or lines.
+- `--scad` adds a ready `polygon(points, paths)` snippet (closed loops only,
+  arcs expanded at `--fn` segments per turn); `--svg` writes a drawing
+  (outer blue, holes red, open chains grey) — convert it with
+  `rsvg-convert` if you need a PNG to look at.
+- Vector options (`--origin`, `--normal`, `--u`, `--window`, `--shift`)
+  accept negative values without the `=` form.
+
 ### `compare` subcommand
 
 ```

@@ -25,10 +25,11 @@ virtualenv setup needed.
 uv run render_views.py model.stl --step 30
 uv run render_views.py model.stl --focus=-36,36,-223,-206.65,6.5,23  # zoom on one feature
 uv run extract_geometry.py model.scad --out geometry.json
+uv run extract_geometry.py slice model.stl --origin 0,0,3.1 --normal 0,0,1 --window -10,10,-10,10 --svg cut.svg
 ```
 
 See [`docs/usage.md`](docs/usage.md) for full options (focus boxes,
-`section`/`compare` subcommands, `--define` for `.scad` variables) and how
+`section`/`slice`/`compare` subcommands, `--define` for `.scad` variables) and how
 view-angle filenames decode. See [`SKILL.md`](SKILL.md) to use this as a
 Claude Code skill.
 

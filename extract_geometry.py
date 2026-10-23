@@ -18,6 +18,8 @@ reports volume and a watertight check.
 Subcommands (see `extract_geometry.py section --help`):
   section  cut the mesh with axis-aligned planes: material intervals along
            scan lines and boundary peaks/troughs (profile)
+  slice    cut the mesh with any plane: closed loops of lines and arcs,
+           optionally as an OpenSCAD polygon() snippet and an SVG drawing
   compare  volume, bounding box, per-normal area and section differences
            between two meshes
 """
@@ -452,6 +454,386 @@ def section_main(argv):
     write_json({"source": str(args.stl), "sections": run_sections(triangles, args)}, args.out)
 
 
+# ---- slice -----------------------------------------------------------------
+
+def parse_vec3(text):
+    try:
+        values = [float(v) for v in text.split(",")]
+    except ValueError:
+        values = []
+    if len(values) != 3:
+        raise argparse.ArgumentTypeError(f"expected 3 comma-separated numbers X,Y,Z, got {text!r}")
+    return np.array(values)
+
+
+def parse_window(text):
+    try:
+        values = [float(v) for v in text.split(",")]
+    except ValueError:
+        values = []
+    if len(values) != 4 or values[0] >= values[1] or values[2] >= values[3]:
+        raise argparse.ArgumentTypeError(f"--window needs UMIN,UMAX,VMIN,VMAX, got {text!r}")
+    return values
+
+
+def slice_frame(normal, u_hint):
+    n = normal / np.linalg.norm(normal)
+    if u_hint is None:
+        u, _ = in_plane_basis(n)
+    else:
+        u = u_hint - np.dot(u_hint, n) * n
+        if np.linalg.norm(u) < 1e-9:
+            sys.exit("--u must not be parallel to --normal")
+        u /= np.linalg.norm(u)
+    return u, np.cross(n, u), n
+
+
+def plane_segments(triangles, normals, origin, frame):
+    """Plane/mesh crossing segments in (u, v), each directed with material on its left."""
+    u, v, n = frame
+    d = (triangles - origin) @ n
+    shift = nudge(0.0, d.ravel(), "plane offset")
+    d = d - shift
+    side = d > 0
+    crossing = side.any(axis=1) & ~side.all(axis=1)
+    segs = []
+    for tri, dist, s, nrm in zip(triangles[crossing], d[crossing], side[crossing], normals[crossing]):
+        pts = [tri[i] + dist[i] / (dist[i] - dist[j]) * (tri[j] - tri[i])
+               for i, j in ((0, 1), (1, 2), (2, 0)) if s[i] != s[j]]
+        a, b = (np.array([(p - origin) @ u, (p - origin) @ v]) for p in pts)
+        outward = np.array([nrm @ u, nrm @ v])
+        step = b - a
+        if step[1] * outward[0] - step[0] * outward[1] < 0:  # right-hand normal must point outward
+            a, b = b, a
+        segs.append((a, b))
+    return segs, shift
+
+
+def clip_segments(segs, window):
+    """Liang-Barsky clip of each segment to the (u, v) box; direction is kept."""
+    umin, umax, vmin, vmax = window
+    out = []
+    for a, b in segs:
+        d = b - a
+        t0, t1 = 0.0, 1.0
+        for p, q in ((-d[0], a[0] - umin), (d[0], umax - a[0]), (-d[1], a[1] - vmin), (d[1], vmax - a[1])):
+            if abs(p) < 1e-15:
+                if q < 0:
+                    t0, t1 = 1.0, 0.0
+                continue
+            t = q / p
+            if p < 0:
+                t0 = max(t0, t)
+            else:
+                t1 = min(t1, t)
+        if t0 < t1:
+            out.append((a + t0 * d, a + t1 * d))
+    return out
+
+
+def chain_loops(segs, snap=1e-5, expect_closed=True):
+    """Join directed segments end-to-start into chains: closed loops (outer CCW, holes CW),
+    or open chains where segments were clipped by a window. Returns (points, closed) pairs."""
+    def key(p):
+        return (round(p[0] / snap), round(p[1] / snap))
+    outgoing, incoming = {}, {}
+    for a, b in segs:
+        if key(a) != key(b):
+            outgoing.setdefault(key(a), []).append((a, b))
+            incoming[key(b)] = incoming.get(key(b), 0) + 1
+    chains = []
+
+    def walk(start):
+        a, b = outgoing[start].pop()
+        pts = [a]
+        current = key(b)
+        while current != start and outgoing.get(current):
+            a, b = outgoing[current].pop()
+            pts.append(a)
+            current = key(b)
+        closed = current == start
+        if not closed:
+            pts.append(b)
+            if expect_closed:
+                print(f"warning: open slice loop ({len(pts)} points) - mesh is not watertight here",
+                      file=sys.stderr)
+        if len(pts) >= (3 if closed else 2):
+            chains.append((np.array(pts), closed))
+
+    # open chains first (they start where nothing comes in), then the remaining cycles
+    for start in [k for k in outgoing if k not in incoming]:
+        while outgoing.get(start):
+            walk(start)
+    for start in list(outgoing):
+        while outgoing.get(start):
+            walk(start)
+    return chains
+
+
+def segment_distances(points, a, b):
+    ab = b - a
+    t = np.clip((points - a) @ ab / max(ab @ ab, 1e-24), 0.0, 1.0)
+    return np.linalg.norm(points - (a + t[:, None] * ab), axis=1)
+
+
+def douglas_peucker(chain, tol):
+    """Keep-mask for an open chain: drop points within tol of the simplified polyline."""
+    keep = np.zeros(len(chain), bool)
+    keep[[0, -1]] = True
+    stack = [(0, len(chain) - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j - i < 2:
+            continue
+        d = segment_distances(chain[i + 1:j], chain[i], chain[j])
+        k = int(np.argmax(d))
+        if d[k] > tol:
+            k += i + 1
+            keep[k] = True
+            stack += [(i, k), (k, j)]
+    return keep
+
+
+def drop_collinear(points, tol):
+    """Simplify a closed loop: split it at its two farthest-apart points and run Douglas-Peucker."""
+    if len(points) <= 3:
+        return points
+    far = int(np.argmax(np.linalg.norm(points - points[0], axis=1)))
+    first, second = points[:far + 1], np.vstack([points[far:], points[:1]])
+    keep = np.concatenate([douglas_peucker(first, tol)[:-1], douglas_peucker(second, tol)[:-1]])
+    out = np.vstack([first[:-1], second[:-1]])[keep]
+    return out if len(out) >= 3 else points
+
+
+def fit_circle(points):
+    # algebraic (Kasa) least squares: x^2 + y^2 + D x + E y + F = 0
+    a = np.column_stack([points[:, 0], points[:, 1], np.ones(len(points))])
+    b = -(points[:, 0] ** 2 + points[:, 1] ** 2)
+    (dd, ee, ff), *_ = np.linalg.lstsq(a, b, rcond=None)
+    center = np.array([-dd / 2, -ee / 2])
+    r2 = center @ center - ff
+    if r2 <= 0:
+        return None, None, np.inf
+    radius = np.sqrt(r2)
+    err = np.abs(np.linalg.norm(points - center, axis=1) - radius).max()
+    return center, radius, err
+
+
+def turn(a, b, c):
+    ab, bc = b - a, c - b
+    return np.arctan2(ab[0] * bc[1] - ab[1] * bc[0], ab @ bc)
+
+
+def arc_ok(run, arc_tol, max_step_deg, max_radius):
+    center, radius, err = fit_circle(run)
+    if center is None or err > arc_tol or radius > max_radius:
+        return None
+    turns = np.array([turn(run[i - 1], run[i], run[i + 1]) for i in range(1, len(run) - 1)])
+    if not len(turns) or np.degrees(np.abs(turns).max()) > max_step_deg:
+        return None
+    # every vertex bends the same way, allowing mesh noise of under a degree the other way
+    if (np.sign(turns.sum()) * turns < -np.radians(1.0)).any() or abs(turns.sum()) < 1e-9:
+        return None
+    return center, radius
+
+
+def loop_items(points, arc_tol, min_arc_points, max_step_deg, max_radius, dec, closed=True):
+    """Split a chain into line and arc items (arcs are runs of points on one circle)."""
+    n = len(points)
+    if closed:
+        whole = arc_ok(np.vstack([points, points[:2]]), arc_tol, max_step_deg, max_radius) if n >= 8 else None
+        if whole is not None:
+            center, radius = whole
+            return [{"type": "circle", "center": rnd(center, dec), "radius": rnd(radius, dec)}]
+        # start at the sharpest corner so no arc wraps across the loop's start
+        corners = [abs(turn(points[i - 1], points[i], points[(i + 1) % n])) for i in range(n)]
+        start = int(np.argmax(corners))
+        pts = np.roll(points, -start, axis=0)
+        pts = np.vstack([pts, pts[:1]])
+    else:
+        pts, n = points, n - 1
+    items, i = [], 0
+    while i < n:
+        best = None
+        j = i + min_arc_points - 1
+        while j <= n:
+            fit = arc_ok(pts[i:j + 1], arc_tol, max_step_deg, max_radius)
+            if fit is None:
+                break
+            best = (j, fit)
+            j += 1
+        if best is not None:
+            j, (center, radius) = best
+            a, b = pts[i], pts[j]
+            ccw = turn(pts[i], pts[i + 1], pts[i + 2]) > 0
+            ang = [float(np.degrees(np.arctan2(*(p - center)[::-1]))) for p in (a, b)]
+            items.append({"type": "arc", "from": rnd(a, dec), "to": rnd(b, dec),
+                          "center": rnd(center, dec), "radius": rnd(radius, dec),
+                          "start_deg": rnd(ang[0], 3), "end_deg": rnd(ang[1], 3), "ccw": bool(ccw)})
+            i = j
+        else:
+            items.append({"type": "line", "from": rnd(pts[i], dec), "to": rnd(pts[i + 1], dec)})
+            i += 1
+    return items
+
+
+def arc_points(item, fn):
+    """Points of an arc or circle item, excluding the end point."""
+    c, r = np.array(item["center"]), item["radius"]
+    if item["type"] == "circle":
+        a0, sweep = 0.0, 360.0
+    else:
+        a0, a1 = item["start_deg"], item["end_deg"]
+        sweep = (a1 - a0) % 360 if item["ccw"] else -((a0 - a1) % 360)
+    steps = max(1, int(np.ceil(abs(sweep) / 360 * fn)))
+    return [c + r * np.array([np.cos(np.radians(a0 + sweep * k / steps)),
+                              np.sin(np.radians(a0 + sweep * k / steps))]) for k in range(steps)]
+
+
+def items_polygon(items, fn):
+    pts = []
+    for item in items:
+        pts += arc_points(item, fn) if item["type"] in ("arc", "circle") else [np.array(item["from"])]
+    return pts
+
+
+def scad_snippet(loops, fn, dec):
+    """polygon() with outer loops CCW and holes CW, arcs expanded at fn segments per turn."""
+    points, paths = [], []
+    for loop in loops:
+        if loop["kind"] == "open":
+            continue
+        pts = items_polygon(loop["items"], fn)
+        paths.append(list(range(len(points), len(points) + len(pts))))
+        points += pts
+    fmt = lambda p: f"[{p[0]:.{dec}f}, {p[1]:.{dec}f}]"
+    return ("polygon(points = [" + ", ".join(fmt(p) for p in points) + "],\n"
+            "        paths = [" + ", ".join("[" + ", ".join(map(str, p)) + "]" for p in paths) + "]);")
+
+
+def svg_document(loops, dec):
+    allpts = np.array([p for loop in loops for p in items_polygon(loop["items"], 72)])
+    lo, hi = allpts.min(axis=0), allpts.max(axis=0)
+    pad = 0.05 * max(hi - lo) + 0.5
+    lo, hi = lo - pad, hi + pad
+    size = hi - lo
+    stroke = max(size) / 400
+    fmt = lambda p: f"{p[0]:.{dec}f},{-p[1]:.{dec}f}"  # SVG y points down
+    paths = []
+    for loop in loops:
+        d = []
+        for item in loop["items"]:
+            if item["type"] == "circle":
+                c, r = item["center"], item["radius"]
+                d.append(f"M{fmt([c[0] + r, c[1]])} A{r},{r} 0 1 0 {fmt([c[0] - r, c[1]])} "
+                         f"A{r},{r} 0 1 0 {fmt([c[0] + r, c[1]])}")
+                continue
+            if not d:
+                d.append(f"M{fmt(item['from'])}")
+            if item["type"] == "line":
+                d.append(f"L{fmt(item['to'])}")
+            else:
+                sweep = (item["end_deg"] - item["start_deg"]) % 360 if item["ccw"] else \
+                        (item["start_deg"] - item["end_deg"]) % 360
+                r = item["radius"]
+                # y is flipped, so a CCW arc in model space is clockwise (sweep-flag 0) in SVG
+                d.append(f"A{r},{r} 0 {int(sweep > 180)} {0 if item['ccw'] else 1} {fmt(item['to'])}")
+        color = {"outer": "#1f5fbf", "hole": "#c0392b", "open": "#333333"}[loop["kind"]]
+        close = "" if loop["kind"] == "open" else " Z"
+        paths.append(f'<path d="{" ".join(d)}{close}" fill="none" stroke="{color}" stroke-width="{stroke:.4f}"/>')
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="{lo[0]:.3f} {-hi[1]:.3f} {size[0]:.3f} '
+            f'{size[1]:.3f}" width="1000" height="{1000 * size[1] / size[0]:.0f}">'
+            f'<rect x="{lo[0]:.3f}" y="{-hi[1]:.3f}" width="{size[0]:.3f}" height="{size[1]:.3f}" fill="white"/>'
+            + "".join(paths) + "</svg>")
+
+
+def slice_main(argv):
+    parser = argparse.ArgumentParser(prog="extract_geometry.py slice", description=(
+        "Cut a mesh with an arbitrary plane and return the cross-section as closed loops of "
+        "lines and arcs in the plane's own (u, v) coordinates: a point (p, q) is "
+        "origin + u*p + v*q. Outer loops run CCW, holes CW (seen from the normal side)."))
+    parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export first")
+    parser.add_argument("--origin", type=parse_vec3, required=True, metavar="X,Y,Z",
+                        help="a point on the cutting plane; becomes (0, 0) in the output")
+    parser.add_argument("--normal", type=parse_vec3, required=True, metavar="NX,NY,NZ",
+                        help="cutting plane normal, e.g. 0,0,1 for a horizontal cut")
+    parser.add_argument("--u", type=parse_vec3, default=None, metavar="UX,UY,UZ",
+                        help="in-plane X direction (projected onto the plane); default: the same "
+                             "frame extract_geometry uses for faces")
+    parser.add_argument("--window", type=parse_window, default=None, metavar="UMIN,UMAX,VMIN,VMAX",
+                        help="clip the cut to this (u, v) box; loops crossing its edge become "
+                             "open chains (kind \"open\")")
+    parser.add_argument("--within", action="store_true",
+                        help="with --window, don't clip: keep only whole loops lying entirely inside it")
+    parser.add_argument("--tol", type=float, default=0.002,
+                        help="drop vertices closer than this (mm) to the line through their neighbours")
+    parser.add_argument("--arc-tol", type=float, default=0.005,
+                        help="max distance (mm) of a point from its fitted arc (default 0.005)")
+    parser.add_argument("--min-arc-points", type=int, default=5,
+                        help="fewest consecutive points that count as an arc (default 5)")
+    parser.add_argument("--max-arc-step", type=float, default=30,
+                        help="max turn (deg) between consecutive arc segments (default 30)")
+    parser.add_argument("--max-radius", type=float, default=1000,
+                        help="ignore arcs with a larger radius (nearly straight, default 1000)")
+    parser.add_argument("--fn", type=int, default=72, help="segments per full turn when expanding arcs for --scad")
+    parser.add_argument("--scad", action="store_true", help="include an OpenSCAD polygon() snippet")
+    parser.add_argument("--svg", type=pathlib.Path, default=None, help="also write the loops as an SVG drawing")
+    parser.add_argument("--shift", type=parse_vec3, default=None, metavar="X,Y,Z",
+                        help="translate the mesh by this before cutting")
+    parser.add_argument("--decimals", type=int, default=4, help="output rounding")
+    parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
+    add_define_option(parser)
+    # vector values often start with '-', which argparse would read as an option: glue them on
+    vector_opts = {"--origin", "--normal", "--u", "--window", "--shift"}
+    glued, i = [], 0
+    while i < len(argv):
+        if argv[i] in vector_opts and i + 1 < len(argv) and argv[i + 1].startswith("-"):
+            glued.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            glued.append(argv[i])
+            i += 1
+    args = parser.parse_args(glued)
+    dec = args.decimals
+
+    triangles = transformed(load_mesh(args.stl, pathlib.Path.cwd(), args.define), args.shift)
+    normals, _ = face_normals_and_areas(triangles)
+    frame = slice_frame(args.normal, args.u)
+    segs, shift = plane_segments(triangles, normals, args.origin, frame)
+    w = args.window
+    clip = w is not None and not args.within
+    if clip:
+        segs = clip_segments(segs, w)
+    loops = []
+    for raw, closed in chain_loops(segs, expect_closed=not clip):
+        if closed:
+            pts = drop_collinear(raw, args.tol)
+        else:
+            pts = raw[douglas_peucker(raw, args.tol)]
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        if w is not None and args.within and (lo[0] < w[0] or hi[0] > w[1] or lo[1] < w[2] or hi[1] > w[3]):
+            continue
+        items = loop_items(pts, args.arc_tol, args.min_arc_points, args.max_arc_step, args.max_radius, dec,
+                           closed)
+        area = polygon_area_2d(pts) if closed else 0.0
+        loops.append({"kind": ("outer" if area > 0 else "hole") if closed else "open",
+                      "area": rnd(abs(area), dec),
+                      "bounding_box": {"u": rnd([lo[0], hi[0]], dec), "v": rnd([lo[1], hi[1]], dec)},
+                      "raw_points": len(raw), "items": items})
+    loops.sort(key=lambda loop: (loop["kind"] == "open", -loop["area"]))
+    u, v, n = frame
+    result = {"source": str(args.stl),
+              "frame": {"origin": rnd(args.origin + shift * n, dec), "u": rnd(u, dec), "v": rnd(v, dec),
+                        "normal": rnd(n, dec)},
+              "loop_count": len(loops), "loops": loops}
+    if args.scad and loops:
+        result["scad"] = scad_snippet(loops, args.fn, dec)
+    if args.svg is not None and loops:
+        args.svg.write_text(svg_document(loops, dec))
+        print(f"svg written to {args.svg}", file=sys.stderr)
+    write_json(result, args.out)
+
+
 # ---- compare ---------------------------------------------------------------
 
 def compare_main(argv):
@@ -548,7 +930,7 @@ def faces_main(argv):
 
 
 def main():
-    commands = {"section": section_main, "compare": compare_main}
+    commands = {"section": section_main, "slice": slice_main, "compare": compare_main}
     if len(sys.argv) > 1 and sys.argv[1] in commands:
         commands[sys.argv[1]](sys.argv[2:])
     else:

@@ -56,9 +56,12 @@ directory.
    barely lands inside.
 
 3. **For localized measurements or diffing two models**, use the
-   `section` and `compare` subcommands of `extract_geometry.py` instead of
-   re-deriving them from the full face list — see
-   [`docs/usage.md`](docs/usage.md) for their flags.
+   `section`, `slice` and `compare` subcommands of `extract_geometry.py`
+   instead of re-deriving them from the full face list — see
+   [`docs/usage.md`](docs/usage.md) for their flags. `slice` is the one
+   to reach for when you need a feature's exact outline: it cuts with any
+   plane (not just X/Y/Z) and returns lines and arcs you can paste into
+   `polygon()`; clip it to the feature with `--window`.
 
 Full flag reference, the `--define`/`-D` passthrough for `.scad` variables,
 and the view-filename decoding table are in [`docs/usage.md`](docs/usage.md).
