@@ -815,7 +815,7 @@ def slice_main(argv):
             continue
         items = loop_items(pts, args.arc_tol, args.min_arc_points, args.max_arc_step, args.max_radius, dec,
                            closed)
-        area = polygon_area_2d(pts) if closed else 0.0
+        area = polygon_area_2d(raw) if closed else 0.0  # raw: simplification error adds up on long loops
         loops.append({"kind": ("outer" if area > 0 else "hole") if closed else "open",
                       "area": rnd(abs(area), dec),
                       "bounding_box": {"u": rnd([lo[0], hi[0]], dec), "v": rnd([lo[1], hi[1]], dec)},
