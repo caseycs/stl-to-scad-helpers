@@ -17,7 +17,9 @@ algorithm, which can show occluded faces through nearer ones). Meant to
 be fed to a vision model (e.g. Haiku) to inspect the model from many sides.
 """
 import argparse
+import concurrent.futures
 import itertools
+import os
 import pathlib
 import sys
 
@@ -109,47 +111,96 @@ def rasterize(triangles, colors, elev, azim, roll, imgsize, frame_points=None):
     margin = 1.1
     half_extent = max(np.abs(frame_rel @ right).max(), np.abs(frame_rel @ up).max()) * margin
     scale = (imgsize / 2) / half_extent
-    px = (x * scale + imgsize / 2)
-    py = (imgsize / 2 - y * scale)
+    tx = x * scale + imgsize / 2
+    ty = imgsize / 2 - y * scale
 
-    depth_buf = np.full((imgsize, imgsize), -np.inf)
-    color_buf = np.full((imgsize, imgsize, 3), 255, dtype=np.uint8)
+    depth_buf = np.full(imgsize * imgsize, -np.inf)
+    tri_buf = np.full(imgsize * imgsize, -1, dtype=np.int64)  # winning triangle per pixel
 
-    for i in range(len(triangles)):
-        tx, ty, tz = px[i], py[i], depth[i]
-        xmin = max(int(np.floor(tx.min())), 0)
-        xmax = min(int(np.ceil(tx.max())), imgsize - 1)
-        ymin = max(int(np.floor(ty.min())), 0)
-        ymax = min(int(np.ceil(ty.max())), imgsize - 1)
-        if xmin > xmax or ymin > ymax:
-            continue
+    # per-triangle range of pixels whose centres (k + 0.5) fall inside its bounding box,
+    # clipped to the image; this drops sub-pixel triangles that cover no pixel centre at all,
+    # which in a dense mesh is most of them. Off-screen and degenerate triangles go too.
+    xmin = np.maximum(np.ceil(tx.min(axis=1) - 0.5), 0).astype(np.int32)
+    xmax = np.minimum(np.floor(tx.max(axis=1) - 0.5), imgsize - 1).astype(np.int32)
+    ymin = np.maximum(np.ceil(ty.min(axis=1) - 0.5), 0).astype(np.int32)
+    ymax = np.minimum(np.floor(ty.max(axis=1) - 0.5), imgsize - 1).astype(np.int32)
+    denom = (ty[:, 1] - ty[:, 2]) * (tx[:, 0] - tx[:, 2]) + (tx[:, 2] - tx[:, 1]) * (ty[:, 0] - ty[:, 2])
+    keep = np.flatnonzero((xmin <= xmax) & (ymin <= ymax) & (denom != 0))
+    if not len(keep):
+        return np.full((imgsize, imgsize, 3), 255, dtype=np.uint8)
 
-        gx, gy = np.meshgrid(
-            np.arange(xmin, xmax + 1) + 0.5, np.arange(ymin, ymax + 1) + 0.5
-        )
+    # barycentric weights as affine functions of the pixel offset from vertex 2:
+    # w0 = a0*dx + b0*dy, w1 = a1*dx + b1*dy, depth = z2 + w0*dz0 + w1*dz1
+    d = denom[keep]
+    a0 = (ty[keep, 1] - ty[keep, 2]) / d
+    b0 = (tx[keep, 2] - tx[keep, 1]) / d
+    a1 = (ty[keep, 2] - ty[keep, 0]) / d
+    b1 = (tx[keep, 0] - tx[keep, 2]) / d
+    ox, oy = tx[keep, 2], ty[keep, 2]
+    z2 = depth[keep, 2]
+    dz0 = depth[keep, 0] - z2
+    dz1 = depth[keep, 1] - z2
+    bx, by = xmin[keep], ymin[keep]
+    bw = xmax[keep] - bx + 1
+    area = bw * (ymax[keep] - ymin[keep] + 1)
 
-        denom = (ty[1] - ty[2]) * (tx[0] - tx[2]) + (tx[2] - tx[1]) * (ty[0] - ty[2])
-        if denom == 0:
-            continue
-        w0 = ((ty[1] - ty[2]) * (gx - tx[2]) + (tx[2] - tx[1]) * (gy - ty[2])) / denom
-        w1 = ((ty[2] - ty[0]) * (gx - tx[2]) + (tx[0] - tx[2]) * (gy - ty[2])) / denom
-        w2 = 1 - w0 - w1
+    # Rasterize triangles in chunks of ~FRAGMENTS candidate pixels at once: every
+    # triangle expands to all pixels of its bounding box, the inside test and the
+    # z-buffer then run as flat array operations instead of a Python loop per triangle.
+    FRAGMENTS = 1 << 21
+    ends = np.cumsum(area)
+    lo = 0
+    while lo < len(keep):
+        hi = max(int(np.searchsorted(ends, (ends[lo - 1] if lo else 0) + FRAGMENTS, "right")), lo + 1)
+        sl = slice(lo, hi)
+        n = area[sl]
+        local = np.repeat(np.arange(hi - lo, dtype=np.int32), n)
+        off = np.arange(n.sum(), dtype=np.int32) - np.repeat((np.cumsum(n) - n).astype(np.int32), n)
+        w = bw[sl][local]
+        gx = bx[sl][local] + off % w
+        gy = by[sl][local] + off // w
+        dx = gx + 0.5 - ox[sl][local]
+        dy = gy + 0.5 - oy[sl][local]
+        w0 = a0[sl][local] * dx + b0[sl][local] * dy
+        w1 = a1[sl][local] * dx + b1[sl][local] * dy
+        inside = (w0 >= 0) & (w1 >= 0) & (w0 + w1 <= 1)
+        local, w0, w1 = local[inside], w0[inside], w1[inside]
+        pix = (gy * imgsize + gx)[inside]
+        pix_depth = z2[sl][local] + w0 * dz0[sl][local] + w1 * dz1[sl][local]
 
-        inside = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
-        if not inside.any():
-            continue
+        # z-buffer merge: only fragments strictly nearer than what earlier chunks drew
+        # compete, the nearest one per pixel wins, and an exact depth tie goes to the
+        # earlier triangle (same result as drawing the triangles one by one with ">")
+        nearer = pix_depth > depth_buf[pix]
+        pix, pix_depth, tri = pix[nearer], pix_depth[nearer], keep[lo + local[nearer]]
+        np.maximum.at(depth_buf, pix, pix_depth)
+        won = pix_depth == depth_buf[pix]
+        pix, tri = pix[won], tri[won]
+        tri_buf[pix] = len(triangles)
+        np.minimum.at(tri_buf, pix, tri)
+        lo = hi
 
-        pix_depth = w0 * tz[0] + w1 * tz[1] + w2 * tz[2]
-        sub_depth = depth_buf[ymin : ymax + 1, xmin : xmax + 1]
-        nearer = inside & (pix_depth > sub_depth)
-        if not nearer.any():
-            continue
+    color_buf = np.full((imgsize * imgsize, 3), 255, dtype=np.uint8)
+    hit = tri_buf >= 0
+    color_buf[hit] = colors[tri_buf[hit]]
+    return color_buf.reshape(imgsize, imgsize, 3)
 
-        sub_depth[nearer] = pix_depth[nearer]
-        sub_color = color_buf[ymin : ymax + 1, xmin : xmax + 1]
-        sub_color[nearer] = colors[i]
 
-    return color_buf
+_scene = None  # per-worker-process copy of the mesh and render settings, set by _init_worker
+
+
+def _init_worker(*scene):
+    global _scene
+    _scene = scene
+
+
+def _render_job(job):
+    triangles, colors, imgsize, frame_points, out_dir = _scene
+    name, elev, azim, roll = job
+    out_path = out_dir / f"{name}.png"
+    buf = rasterize(triangles, colors, elev, azim, roll, imgsize, frame_points)
+    Image.fromarray(buf, "RGB").save(out_path)
+    return out_path
 
 
 def main():
@@ -193,11 +244,12 @@ def main():
         jobs.append((f"azim{a:03d}", base_elev, a, base_roll))
         jobs.append((f"roll{a:03d}", base_elev, base_azim, a))
 
-    for name, elev, azim, roll in jobs:
-        out_path = args.out / f"{name}.png"
-        buf = rasterize(triangles, colors, elev, azim, roll, args.imgsize, frame_points)
-        Image.fromarray(buf, "RGB").save(out_path)
-        print(out_path)
+    # one view per task across all cores; the mesh is sent to each worker once, not per view
+    scene = (triangles, colors, args.imgsize, frame_points, args.out)
+    workers = min(os.cpu_count() or 1, len(jobs))
+    with concurrent.futures.ProcessPoolExecutor(workers, initializer=_init_worker, initargs=scene) as pool:
+        for out_path in pool.map(_render_job, jobs):
+            print(out_path)
 
     print(f"{len(jobs)} images written to {args.out}/")
 
