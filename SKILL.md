@@ -17,6 +17,7 @@ a scratch directory: a `.scad` input is exported to
 | --- | --- |
 | `render_views.py MODEL --step 90 [--focus=X0,X1,Y0,Y1,Z0,Z1]` | PNGs from many angles, one color per surface orientation |
 | `extract_geometry.py MODEL --min-area A [--box X0,X1,Y0,Y1,Z0,Z1] --out geo.json` | health (`watertight`, `volume`, `bounding_box`, where any `bad_edges` are) + every flat face: normal, offset, outline and hole loops; `--box` keeps one feature's faces |
+| `extract_geometry.py MODEL --stats` | health only, no faces: seconds even on a million-triangle mesh |
 | `extract_geometry.py slice MODEL --origin P --normal N [--window U0,U1,V0,V1 [--within]] [--scad]` | cross-section on any plane as lines/arcs/circles (centers, radii), optional `polygon()` |
 | `extract_geometry.py thread MODEL --center P [--axis A] [--rmax R]` | a threaded hole: minor/major radius, pitch, lead, starts, hand, crest/root flats, flank angle, phase |
 | `extract_geometry.py section MODEL --cut Y=a,b --scan Z=c,d [--profile X]` | material intervals along scan lines; peaks/troughs of a cut's boundary |

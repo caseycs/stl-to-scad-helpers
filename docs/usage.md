@@ -42,7 +42,11 @@ largest area first.
   surface; `over-shared`: three or more faces, e.g. two solids touching
   along an edge), `count`, `center`, `bounding_box`.
 - `--box X0,X1,Y0,Y1,Z0,Z1` keeps only faces whose bounding box lies inside
-  the box.
+  the box. `--min-area` and `--box` filter before the per-face loops are
+  built, so a tight filter is also the fast path; many surviving faces are
+  built on all cores.
+- `--stats` prints only the top level above, without `faces`, and skips the
+  plane grouping entirely.
 
 A face is every triangle on one plane (normal within 2e-3, offset within
 0.02 mm), so one plane with separate regions has several `outer` loops.

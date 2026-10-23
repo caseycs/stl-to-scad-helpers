@@ -24,7 +24,9 @@ Subcommands (see `extract_geometry.py section --help`):
            between two meshes
 """
 import argparse
+import concurrent.futures
 import json
+import os
 import pathlib
 import sys
 
@@ -164,7 +166,54 @@ def polygon_area_2d(points):
     return 0.5 * np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y)
 
 
-def extract_faces(triangles, decimals=4):
+def face_record(g, mask, triangles, normals, areas, vertices, tri_vert_ids, decimals):
+    group_tris = tri_vert_ids[mask]
+    normal = (normals[mask] * areas[mask, None]).sum(axis=0)
+    normal /= np.linalg.norm(normal)
+    offset = np.average(triangles[mask].mean(axis=1) @ normal, weights=areas[mask])
+    pts = vertices[np.unique(group_tris)]
+
+    loops = []
+    u, v = in_plane_basis(normal)
+    origin = vertices[group_tris[0, 0]]
+    for loop_ids in boundary_loops(group_tris):
+        loop_pts = vertices[loop_ids]
+        rel = loop_pts - origin
+        uv = np.column_stack([rel @ u, rel @ v])
+        loops.append({
+            "kind": "outer" if polygon_area_2d(uv) > 0 else "hole",
+            "points_3d": rnd(loop_pts, decimals),
+            "points_2d": rnd(uv, decimals),
+        })
+    loops.sort(key=lambda loop: loop["kind"] != "outer")
+
+    return {
+        "id": int(g),
+        "normal": rnd(normal, decimals),
+        "plane_offset": rnd(offset, decimals),
+        "area": rnd(areas[mask].sum(), decimals),
+        "triangle_count": len(mask),
+        "bounding_box": bbox(pts, decimals),
+        # points_2d = origin + u*p[0] + v*p[1] in model coordinates
+        "frame": {"origin": rnd(origin, decimals), "u": rnd(u, decimals), "v": rnd(v, decimals)},
+        "loops": loops,
+    }
+
+
+_FACE_DATA = None
+
+
+def _init_face_worker(*data):
+    global _FACE_DATA
+    _FACE_DATA = data
+
+
+def _face_records(groups):
+    assert _FACE_DATA is not None, "worker started without _init_face_worker"
+    return [face_record(g, mask, *_FACE_DATA) for g, mask in groups]
+
+
+def extract_faces(triangles, decimals=4, min_area=None, box=None):
     normals, areas = face_normals_and_areas(triangles)
     degenerate = areas <= 1e-9
     if degenerate.any():
@@ -176,40 +225,33 @@ def extract_faces(triangles, decimals=4):
 
     vertices, tri_vert_ids = dedupe_vertices(triangles, decimals)
     group_ids = group_coplanar(triangles, normals, areas)
+    groups = list(split_groups(group_ids))
 
-    faces = []
-    for g, mask in split_groups(group_ids):
-        group_tris = tri_vert_ids[mask]
-        normal = (normals[mask] * areas[mask, None]).sum(axis=0)
-        normal /= np.linalg.norm(normal)
-        offset = np.average(triangles[mask].mean(axis=1) @ normal, weights=areas[mask])
-        pts = vertices[np.unique(group_tris)]
+    # filter on area and bounding box first, vectorized: building a face record
+    # costs far more than this, and a curved mesh has tens of thousands of faces
+    if min_area is not None or box is not None:
+        order = np.argsort(group_ids, kind="stable")
+        starts = np.unique(group_ids[order], return_index=True)[1]
+        g_area = np.add.reduceat(areas[order], starts)
+        g_lo = np.minimum.reduceat(triangles[order].min(axis=1), starts)
+        g_hi = np.maximum.reduceat(triangles[order].max(axis=1), starts)
+        keep = np.ones(len(groups), bool)
+        if min_area is not None:
+            keep &= g_area >= min_area
+        if box is not None:
+            b = np.array(box).reshape(3, 2)
+            keep &= ((g_lo >= b[:, 0]) & (g_hi <= b[:, 1])).all(axis=1)
+        groups = [grp for grp, k in zip(groups, keep) if k]
 
-        loops = []
-        u, v = in_plane_basis(normal)
-        origin = vertices[group_tris[0, 0]]
-        for loop_ids in boundary_loops(group_tris):
-            loop_pts = vertices[loop_ids]
-            rel = loop_pts - origin
-            uv = np.column_stack([rel @ u, rel @ v])
-            loops.append({
-                "kind": "outer" if polygon_area_2d(uv) > 0 else "hole",
-                "points_3d": rnd(loop_pts, decimals),
-                "points_2d": rnd(uv, decimals),
-            })
-        loops.sort(key=lambda loop: loop["kind"] != "outer")
-
-        faces.append({
-            "id": int(g),
-            "normal": rnd(normal, decimals),
-            "plane_offset": rnd(offset, decimals),
-            "area": rnd(areas[mask].sum(), decimals),
-            "triangle_count": len(mask),
-            "bounding_box": bbox(pts, decimals),
-            # points_2d = origin + u*p[0] + v*p[1] in model coordinates
-            "frame": {"origin": rnd(origin, decimals), "u": rnd(u, decimals), "v": rnd(v, decimals)},
-            "loops": loops,
-        })
+    data = (triangles, normals, areas, vertices, tri_vert_ids, decimals)
+    workers = min(os.cpu_count() or 1, 16)
+    if len(groups) < 2000 or workers < 2:
+        faces = [face_record(g, mask, *data) for g, mask in groups]
+    else:
+        chunk = -(-len(groups) // (workers * 4))
+        with concurrent.futures.ProcessPoolExecutor(workers, initializer=_init_face_worker, initargs=data) as pool:
+            parts = pool.map(_face_records, [groups[k:k + chunk] for k in range(0, len(groups), chunk)])
+            faces = [f for part in parts for f in part]
 
     faces.sort(key=lambda f: -f["area"])
     return faces
@@ -1269,17 +1311,18 @@ def faces_main(argv):
     parser.add_argument("--box", type=parse_box, default=None, metavar="X0,X1,Y0,Y1,Z0,Z1",
                         help="keep only faces whose bounding box lies inside this box, e.g. the "
                              "faces of one pocket or boss")
+    parser.add_argument("--stats", action="store_true",
+                        help="only report mesh health (volume, watertight, bad edges, bounding box): "
+                             "skips the face grouping, so it stays fast on large meshes")
     add_define_option(parser)
     args = parser.parse_args(glue_vector_values(argv, {"--box"}))
 
     triangles = load_mesh(args.stl, pathlib.Path.cwd(), args.define)
-    faces = extract_faces(triangles, args.decimals)
-    if args.min_area is not None:
-        faces = [f for f in faces if f["area"] >= args.min_area]
-    if args.box is not None:
-        b = args.box
-        faces = [f for f in faces if all(b[2 * k] <= f["bounding_box"][a][0] and f["bounding_box"][a][1] <= b[2 * k + 1]
-                                         for k, a in enumerate("xyz"))]
+    if args.stats:
+        write_json({"source": str(args.stl), "bounding_box": bbox(triangles.reshape(-1, 3), args.decimals),
+                    **mesh_stats(triangles, args.decimals)}, args.out)
+        return
+    faces = extract_faces(triangles, args.decimals, args.min_area, args.box)
 
     result = {
         "source": str(args.stl),
