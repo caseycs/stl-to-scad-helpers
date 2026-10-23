@@ -31,7 +31,18 @@ value (`elev=25`, `azim=-60`, `roll=0`):
 
 Top level: `bounding_box`, `volume`, `volume_sign` (-1 = inside-out mesh,
 which also swaps outer/hole), `watertight`, `bad_edge_count`,
-`triangle_count`, `face_count`, and `faces`, largest area first.
+`collapsed_triangle_count`, `triangle_count`, `face_count`, and `faces`,
+largest area first.
+
+- Slivers thinner than the vertex rounding (`--decimals`) collapse to a line
+  or point; they are counted in `collapsed_triangle_count` and left out of
+  the edge check, which is common in CSG output and harmless.
+- `bad_edges` (only when `bad_edge_count` > 0): where they are, grouped per
+  kind on a 1 mm grid, biggest first: `kind` (`open`: one face, a hole in the
+  surface; `over-shared`: three or more faces, e.g. two solids touching
+  along an edge), `count`, `center`, `bounding_box`.
+- `--box X0,X1,Y0,Y1,Z0,Z1` keeps only faces whose bounding box lies inside
+  the box.
 
 A face is every triangle on one plane (normal within 2e-3, offset within
 0.02 mm), so one plane with separate regions has several `outer` loops.
@@ -78,17 +89,55 @@ off a vertex (stderr warning):
 - `--window` clips to a `(u, v)` box; `--within` keeps whole loops inside it
   instead. `--svg` draws outer blue, holes red, open chains grey.
 
+## thread
+
+Radial rays from the axis (`--center`, `--axis`, default `+Z`) at `--angles`
+evenly spaced angles, every `--step` mm along it; the first surface each ray
+meets gives `r(t)`. Angles turn counter-clockwise seen from the axis tip,
+starting at `u` (`+X` for a `+Z` axis); `t` is measured along the axis from
+`--center`.
+
+- `minor_radius` (crest, the thread's inner tips) and `major_radius` (root),
+  `depth`.
+- `pitch` (axial distance between crests), `lead` (axial advance per turn),
+  `starts` (`lead / pitch`), `handedness` (`right`: the crest climbs as the
+  angle grows).
+- `crest_flat`, `root_flat`, `flank_axial` (axial length of one flank),
+  `flank_angle_deg` (flank against the radial direction: 45 for a square
+  45° flank, 60 for a 30° half-angle).
+- Phase: `crest_center_at_0deg` (the crest centre on the angle-0 ray),
+  `crest_angle_at_ref` (the angle where a crest centre sits at `t = ref`),
+  `repeats_every_deg`.
+- `profile_0deg`: the simplified `[t, r]` corners of the angle-0 ray;
+  `crest_centers_by_angle`: whole crests seen on each ray.
+- Entry chamfers are recognised (outside the root, or sloped unlike the
+  thread's flanks) and skipped, so the default `--range` is the whole hole.
+  Flats are only measured between two thread runs, so a thread with less
+  than about two pitches of length reports `null` pitch or phase: lengthen
+  `--range` or add `--angles`.
+
 ## compare
 
 `--mirror-x` then `--shift` apply to B only; there is no auto-alignment.
 `--define` applies to both models, `--define-b` adds an override for B only
 (compare one `.scad` under two `-D` values).
 
-- `a_stats`, `b_stats`: `volume`, `volume_sign`, `watertight`,
-  `bad_edge_count`, `triangle_count`, `bounding_box`.
+- `a_stats`, `b_stats`: as the faces command's top level (`volume`,
+  `volume_sign`, `watertight`, `bad_edge_count`, `collapsed_triangle_count`,
+  `bad_edges`, `triangle_count`) plus `bounding_box`.
 - `volume_diff`: B − A.
 - `area_by_normal`: rows of `normal`, `area_a`, `area_b`, `diff` (B − A),
   normals grouped within `--normal-tol`.
 - `sections` (with `--cut`): per cut, `a`/`b` as in `section`, plus
   `scan_diffs`: per scan line `same_count` and `b_minus_a` (interval-wise,
   `null` when counts differ).
+- `slices` (with `--slice AXIS=…`): both meshes cut as in `slice`, framed so
+  `(u, v)` is `(y, z)` for X, `(x, z)` for Y and `(x, y)` for Z; `--window`
+  clips in that frame. Per cut: `net_area_a`/`_b`, `area_diff`,
+  `loop_count_a`/`_b`; `unmatched_a`/`_b` (loops with no same-kind partner
+  overlapping by more than half its bounding box); and `loop_diffs` for
+  matched loops whose areas differ by more than `--area-tol` or whose items
+  differ, largest first: `area_a`, `area_b`, `diff`, and `only_a`/`only_b`,
+  the lines/arcs with no partner within `--match-tol` (ends, centre and
+  radius). Arcs fitted along a spiral edge (a thread) differ run to run, so
+  expect a few matched-area loops listing arcs there.

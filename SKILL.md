@@ -16,10 +16,11 @@ a scratch directory: a `.scad` input is exported to
 | Command | Gives you |
 | --- | --- |
 | `render_views.py MODEL --step 90 [--focus=X0,X1,Y0,Y1,Z0,Z1]` | PNGs from many angles, one color per surface orientation |
-| `extract_geometry.py MODEL --min-area A --out geo.json` | health (`watertight`, `volume`, `bounding_box`) + every flat face: normal, offset, outline and hole loops |
+| `extract_geometry.py MODEL --min-area A [--box X0,X1,Y0,Y1,Z0,Z1] --out geo.json` | health (`watertight`, `volume`, `bounding_box`, where any `bad_edges` are) + every flat face: normal, offset, outline and hole loops; `--box` keeps one feature's faces |
 | `extract_geometry.py slice MODEL --origin P --normal N [--window U0,U1,V0,V1 [--within]] [--scad]` | cross-section on any plane as lines/arcs/circles (centers, radii), optional `polygon()` |
+| `extract_geometry.py thread MODEL --center P [--axis A] [--rmax R]` | a threaded hole: minor/major radius, pitch, lead, starts, hand, crest/root flats, flank angle, phase |
 | `extract_geometry.py section MODEL --cut Y=a,b --scan Z=c,d [--profile X]` | material intervals along scan lines; peaks/troughs of a cut's boundary |
-| `extract_geometry.py compare A B [--cut … --scan …]` | volume, bbox and area-per-normal diffs (B − A), section diffs |
+| `extract_geometry.py compare A B [--cut … --scan …] [--slice Z=a,b [--window …]]` | volume, bbox and area-per-normal diffs (B − A), section diffs; `--slice` diffs cuts loop by loop down to the lines/arcs only one side has |
 
 Flags: `--help` on each command. Output fields, frames and camera angles:
 [`docs/usage.md`](docs/usage.md).
@@ -69,9 +70,11 @@ Flags: `--help` on each command. Output fields, frames and camera angles:
 4. **Plan the CSG.** List base body + features, each as an OpenSCAD
    primitive and the tool that will measure it:
    - axis-aligned outline or straight-edged hole → face loops (`points_3d`)
-   - round, threaded or sloped feature → `slice` at mid-height of the
+   - round or sloped feature → `slice` at mid-height of the
      feature, `--window` around one instance (`--within` for whole loops);
      arcs give center and radius, `--scad` gives a `polygon()`
+   - threaded hole → `thread` on its axis; check its phase on a second
+     instance (`crest_angle_at_ref` at the same `--ref`)
    - heights, wall thickness, chamfers, depths → `section --scan` intervals
      and `--profile`
 
@@ -90,8 +93,14 @@ Flags: `--help` on each command. Output fields, frames and camera angles:
    names the wrong surface family. Repeat until the bounding boxes match,
    `volume_diff` is within ~0.5 % of volume, every flat-face normal matches
    in area, and each scan has `same_count: true` with `b_minus_a` near 0
-   (leftover diffs on curved normals come from `$fn` tessellation). Finish
-   with `render_views.py model.scad --step 90` against step 1's views.
+   (leftover diffs on curved normals come from `$fn` tessellation). Then
+   `compare … --slice Z=…` at each feature's heights: a feature with the right
+   volume in the wrong place (a transposed pattern, a mirrored mark) passes
+   every check above and shows up only here, as `unmatched_*` loops or
+   `only_a`/`only_b` items. Done when every loop matches and the remaining
+   `loop_diffs` are arc-fit noise (same ends, slightly different arcs along a
+   thread or other spiral edge). Finish with `render_views.py model.scad
+   --step 90` against step 1's views.
 
 For a single measurement or a diff, run just the matching step's tool.
 

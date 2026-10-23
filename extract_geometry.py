@@ -215,20 +215,40 @@ def extract_faces(triangles, decimals=4):
     return faces
 
 
+def bad_edge_clusters(verts, edges, counts, decimals, limit=20):
+    """Where the bad edges are: grouped per kind on a 1 mm grid, biggest groups first."""
+    mids = verts[edges].mean(axis=1)
+    kinds = np.where(counts == 1, "open", "over-shared")
+    groups = {}
+    for kind, mid in zip(kinds, mids):
+        groups.setdefault((kind, *np.floor(mid).astype(int)), []).append(mid)
+    rows = [{"kind": key[0], "count": len(pts), "center": rnd(np.mean(pts, axis=0), decimals),
+             "bounding_box": bbox(np.array(pts), decimals)} for key, pts in groups.items()]
+    return sorted(rows, key=lambda r: -r["count"])[:limit]
+
+
 def mesh_stats(triangles, decimals=4):
     # signed volume: sum of tetrahedra to the origin, positive for outward normals
     signed = np.einsum("ij,ij->i", triangles[:, 0], np.cross(triangles[:, 1], triangles[:, 2])).sum() / 6
-    _, ids = dedupe_vertices(triangles, decimals)
-    edges = np.sort(np.concatenate([ids[:, [0, 1]], ids[:, [1, 2]], ids[:, [2, 0]]]), axis=1)
-    _, counts = np.unique(edges, axis=0, return_counts=True)
-    bad = int((counts != 2).sum())
-    return {
+    verts, ids = dedupe_vertices(triangles, decimals)
+    # slivers thinner than the rounding collapse to a line or point; they carry no surface, so
+    # their edges are left out instead of being reported as defects
+    collapsed = (ids[:, 0] == ids[:, 1]) | (ids[:, 1] == ids[:, 2]) | (ids[:, 2] == ids[:, 0])
+    good = ids[~collapsed]
+    edges = np.sort(np.concatenate([good[:, [0, 1]], good[:, [1, 2]], good[:, [2, 0]]]), axis=1)
+    uniq, counts = np.unique(edges, axis=0, return_counts=True)
+    bad_mask = counts != 2
+    stats = {
         "volume": rnd(abs(signed), decimals),
         "volume_sign": 1 if signed >= 0 else -1,
-        "watertight": bad == 0,
-        "bad_edge_count": bad,
+        "watertight": not bad_mask.any(),
+        "bad_edge_count": int(bad_mask.sum()),
+        "collapsed_triangle_count": int(collapsed.sum()),
         "triangle_count": len(triangles),
     }
+    if bad_mask.any():
+        stats["bad_edges"] = bad_edge_clusters(verts, uniq[bad_mask], counts[bad_mask], decimals)
+    return stats
 
 
 # ---- section ---------------------------------------------------------------
@@ -476,6 +496,26 @@ def parse_window(text):
     return values
 
 
+def parse_box(text):
+    try:
+        values = [float(v) for v in text.split(",")]
+    except ValueError:
+        values = []
+    if len(values) != 6 or any(values[k] >= values[k + 1] for k in (0, 2, 4)):
+        raise argparse.ArgumentTypeError(f"--box needs X0,X1,Y0,Y1,Z0,Z1 with each min < max, got {text!r}")
+    return values
+
+
+def parse_window_pair(text):
+    try:
+        values = [float(v) for v in text.split(",")]
+    except ValueError:
+        values = []
+    if len(values) != 2 or values[0] >= values[1]:
+        raise argparse.ArgumentTypeError(f"expected T0,T1 with T0 < T1, got {text!r}")
+    return values
+
+
 def slice_frame(normal, u_hint):
     n = normal / np.linalg.norm(normal)
     if u_hint is None:
@@ -594,14 +634,34 @@ def douglas_peucker(chain, tol):
     return keep
 
 
+def prune_collinear(points, tol, closed=True):
+    """Drop vertices lying within tol of the segment between their neighbours, until none do."""
+    pts = points
+    while len(pts) > (3 if closed else 2):
+        prev = np.roll(pts, 1, axis=0)
+        nxt = np.roll(pts, -1, axis=0)
+        ab = nxt - prev
+        t = np.clip(np.einsum("ij,ij->i", pts - prev, ab) / np.maximum(np.einsum("ij,ij->i", ab, ab), 1e-24), 0, 1)
+        dev = np.linalg.norm(pts - (prev + t[:, None] * ab), axis=1)
+        if not closed:
+            dev[[0, -1]] = np.inf
+        drop = dev < tol
+        drop &= ~np.roll(drop, 1)  # never two neighbours in one pass: each check assumes its neighbours stay
+        if not drop.any():
+            break
+        pts = pts[~drop]
+    return pts
+
+
 def drop_collinear(points, tol):
-    """Simplify a closed loop: split it at its two farthest-apart points and run Douglas-Peucker."""
+    """Simplify a closed loop: split it at its two farthest-apart points and run Douglas-Peucker,
+    then prune the split points too when they turn out collinear."""
     if len(points) <= 3:
         return points
     far = int(np.argmax(np.linalg.norm(points - points[0], axis=1)))
     first, second = points[:far + 1], np.vstack([points[far:], points[:1]])
     keep = np.concatenate([douglas_peucker(first, tol)[:-1], douglas_peucker(second, tol)[:-1]])
-    out = np.vstack([first[:-1], second[:-1]])[keep]
+    out = prune_collinear(np.vstack([first[:-1], second[:-1]])[keep], tol)
     return out if len(out) >= 3 else points
 
 
@@ -747,6 +807,60 @@ def svg_document(loops, dec):
             + "".join(paths) + "</svg>")
 
 
+def glue_vector_values(argv, opts):
+    """Vector values often start with '-', which argparse reads as an option: glue them on as --opt=value."""
+    glued, i = [], 0
+    while i < len(argv):
+        if argv[i] in opts and i + 1 < len(argv) and argv[i + 1].startswith("-"):
+            glued.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            glued.append(argv[i])
+            i += 1
+    return glued
+
+
+def slice_loops(triangles, normals, origin, frame, window, within, opts, dec):
+    """Cross-section loops (see slice --help); opts carries tol, arc_tol, min_arc_points,
+    max_arc_step and max_radius. Returns (loops, plane shift applied to dodge vertices)."""
+    segs, shift = plane_segments(triangles, normals, origin, frame)
+    clip = window is not None and not within
+    if clip:
+        segs = clip_segments(segs, window)
+    loops = []
+    for raw, closed in chain_loops(segs, expect_closed=not clip):
+        if closed:
+            pts = drop_collinear(raw, opts.tol)
+        else:
+            pts = prune_collinear(raw[douglas_peucker(raw, opts.tol)], opts.tol, closed=False)
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        w = window
+        if w is not None and within and (lo[0] < w[0] or hi[0] > w[1] or lo[1] < w[2] or hi[1] > w[3]):
+            continue
+        items = loop_items(pts, opts.arc_tol, opts.min_arc_points, opts.max_arc_step, opts.max_radius, dec,
+                           closed)
+        area = polygon_area_2d(raw) if closed else 0.0  # raw: simplification error adds up on long loops
+        loops.append({"kind": ("outer" if area > 0 else "hole") if closed else "open",
+                      "area": rnd(abs(area), dec),
+                      "bounding_box": {"u": rnd([lo[0], hi[0]], dec), "v": rnd([lo[1], hi[1]], dec)},
+                      "raw_points": len(raw), "items": items})
+    loops.sort(key=lambda loop: (loop["kind"] == "open", -loop["area"]))
+    return loops, shift
+
+
+def add_slice_fit_options(parser):
+    parser.add_argument("--tol", type=float, default=0.002,
+                        help="drop vertices closer than this (mm) to the line through their neighbours")
+    parser.add_argument("--arc-tol", type=float, default=0.005,
+                        help="max distance (mm) of a point from its fitted arc (default 0.005)")
+    parser.add_argument("--min-arc-points", type=int, default=5,
+                        help="fewest consecutive points that count as an arc (default 5)")
+    parser.add_argument("--max-arc-step", type=float, default=30,
+                        help="max turn (deg) between consecutive arc segments (default 30)")
+    parser.add_argument("--max-radius", type=float, default=1000,
+                        help="ignore arcs with a larger radius (nearly straight, default 1000)")
+
+
 def slice_main(argv):
     parser = argparse.ArgumentParser(prog="extract_geometry.py slice", description=(
         "Cut a mesh with an arbitrary plane and return the cross-section as closed loops of "
@@ -765,16 +879,7 @@ def slice_main(argv):
                              "open chains (kind \"open\")")
     parser.add_argument("--within", action="store_true",
                         help="with --window, don't clip: keep only whole loops lying entirely inside it")
-    parser.add_argument("--tol", type=float, default=0.002,
-                        help="drop vertices closer than this (mm) to the line through their neighbours")
-    parser.add_argument("--arc-tol", type=float, default=0.005,
-                        help="max distance (mm) of a point from its fitted arc (default 0.005)")
-    parser.add_argument("--min-arc-points", type=int, default=5,
-                        help="fewest consecutive points that count as an arc (default 5)")
-    parser.add_argument("--max-arc-step", type=float, default=30,
-                        help="max turn (deg) between consecutive arc segments (default 30)")
-    parser.add_argument("--max-radius", type=float, default=1000,
-                        help="ignore arcs with a larger radius (nearly straight, default 1000)")
+    add_slice_fit_options(parser)
     parser.add_argument("--fn", type=int, default=72, help="segments per full turn when expanding arcs for --scad")
     parser.add_argument("--scad", action="store_true", help="include an OpenSCAD polygon() snippet")
     parser.add_argument("--svg", type=pathlib.Path, default=None, help="also write the loops as an SVG drawing")
@@ -783,44 +888,13 @@ def slice_main(argv):
     parser.add_argument("--decimals", type=int, default=4, help="output rounding")
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
     add_define_option(parser)
-    # vector values often start with '-', which argparse would read as an option: glue them on
-    vector_opts = {"--origin", "--normal", "--u", "--window", "--shift"}
-    glued, i = [], 0
-    while i < len(argv):
-        if argv[i] in vector_opts and i + 1 < len(argv) and argv[i + 1].startswith("-"):
-            glued.append(f"{argv[i]}={argv[i + 1]}")
-            i += 2
-        else:
-            glued.append(argv[i])
-            i += 1
-    args = parser.parse_args(glued)
+    args = parser.parse_args(glue_vector_values(argv, {"--origin", "--normal", "--u", "--window", "--shift"}))
     dec = args.decimals
 
     triangles = transformed(load_mesh(args.stl, pathlib.Path.cwd(), args.define), args.shift)
     normals, _ = face_normals_and_areas(triangles)
     frame = slice_frame(args.normal, args.u)
-    segs, shift = plane_segments(triangles, normals, args.origin, frame)
-    w = args.window
-    clip = w is not None and not args.within
-    if clip:
-        segs = clip_segments(segs, w)
-    loops = []
-    for raw, closed in chain_loops(segs, expect_closed=not clip):
-        if closed:
-            pts = drop_collinear(raw, args.tol)
-        else:
-            pts = raw[douglas_peucker(raw, args.tol)]
-        lo, hi = pts.min(axis=0), pts.max(axis=0)
-        if w is not None and args.within and (lo[0] < w[0] or hi[0] > w[1] or lo[1] < w[2] or hi[1] > w[3]):
-            continue
-        items = loop_items(pts, args.arc_tol, args.min_arc_points, args.max_arc_step, args.max_radius, dec,
-                           closed)
-        area = polygon_area_2d(raw) if closed else 0.0  # raw: simplification error adds up on long loops
-        loops.append({"kind": ("outer" if area > 0 else "hole") if closed else "open",
-                      "area": rnd(abs(area), dec),
-                      "bounding_box": {"u": rnd([lo[0], hi[0]], dec), "v": rnd([lo[1], hi[1]], dec)},
-                      "raw_points": len(raw), "items": items})
-    loops.sort(key=lambda loop: (loop["kind"] == "open", -loop["area"]))
+    loops, shift = slice_loops(triangles, normals, args.origin, frame, args.window, args.within, args, dec)
     u, v, n = frame
     result = {"source": str(args.stl),
               "frame": {"origin": rnd(args.origin + shift * n, dec), "u": rnd(u, dec), "v": rnd(v, dec),
@@ -834,7 +908,274 @@ def slice_main(argv):
     write_json(result, args.out)
 
 
+# ---- thread ----------------------------------------------------------------
+
+def radial_hits(triangles, center, frame, ts, angles, rmax, chunk=64):
+    """Distance from the axis to the first surface along radial rays: array (len(ts), len(angles)),
+    NaN where nothing is hit within rmax."""
+    u, v, axis = frame
+    rel = triangles - center
+    t_tri = rel @ axis
+    rad = np.linalg.norm(rel - t_tri[..., None] * axis, axis=2)
+    near = (rad.min(axis=1) < rmax) & (t_tri.max(axis=1) >= ts.min()) & (t_tri.min(axis=1) <= ts.max())
+    tri = triangles[near]
+    p0, e1, e2 = tri[:, 0], tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]
+    out = np.full((len(ts), len(angles)), np.nan)
+    for j, a in enumerate(angles):
+        d = np.cos(np.radians(a)) * u + np.sin(np.radians(a)) * v
+        h = np.cross(d, e2)
+        det = np.einsum("ij,ij->i", e1, h)
+        ok = np.abs(det) > 1e-12
+        inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+        for k in range(0, len(ts), chunk):  # Moller-Trumbore, rays x triangles
+            s = (center + ts[k:k + chunk, None] * axis)[:, None, :] - p0[None]
+            bu = np.einsum("rtk,tk->rt", s, h) * inv
+            q = np.cross(s, e1[None])
+            bv = (q @ d) * inv
+            dist = np.einsum("rtk,tk->rt", q, e2) * inv
+            hit = ok & (bu >= 0) & (bu <= 1) & (bv >= 0) & (bu + bv <= 1) & (dist > 1e-6) & (dist <= rmax)
+            best = np.where(hit, dist, np.inf).min(axis=1)
+            out[k:k + chunk, j] = np.where(np.isfinite(best), best, np.nan)
+    return out
+
+
+def plateau_radius(r, r_lo):
+    """The root radius: the most populated radius in the upper part of the samples. Root flats
+    pile samples onto one value; entry chamfers spread theirs, so they don't win."""
+    upper = r[np.isfinite(r) & (r > r_lo + 0.3 * (np.nanmax(r) - r_lo))]
+    if not len(upper):
+        return np.nanmax(r)
+    counts, edges = np.histogram(upper, bins=np.arange(upper.min(), upper.max() + 0.004, 0.002))
+    k = int(np.argmax(counts))
+    peak = upper[(upper >= edges[k]) & (upper <= edges[k + 1])]
+    return float(np.median(peak))
+
+
+def profile_segments(ts, r, tol, r_lo, r_hi, band):
+    """Douglas-Peucker the (t, r) profile into runs of crest (at r_lo), root (at r_hi), flank,
+    or beyond (outside the root, e.g. an entry chamfer); neighbouring runs of a kind merge."""
+    ok = np.isfinite(r)
+    pts = np.column_stack([ts[ok], r[ok]])
+    if len(pts) < 3:
+        return pts, []
+    pts = prune_collinear(pts[douglas_peucker(pts, tol)], tol, closed=False)
+    segs = []
+    for a, b in zip(pts[:-1], pts[1:]):
+        lo, hi = min(a[1], b[1]), max(a[1], b[1])
+        kind = ("beyond" if hi > r_hi + band else "crest" if hi <= r_lo + band
+                else "root" if lo >= r_hi - band else "flank")
+        if segs and segs[-1][0] == kind:
+            segs[-1] = (kind, segs[-1][1], b[0])
+        else:
+            segs.append((kind, a[0], b[0]))
+    return pts, segs
+
+
+def thread_main(argv):
+    parser = argparse.ArgumentParser(prog="extract_geometry.py thread", description=(
+        "Measure an internal thread (a threaded hole) around an axis by casting radial rays from "
+        "the axis: minor/major radius, pitch, lead, starts, handedness, crest/root flats, flank, "
+        "phase, and the axial profile. Angles are measured about the axis from u, counter-"
+        "clockwise seen from the axis tip; t is the position along the axis from --center."))
+    parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export first")
+    parser.add_argument("--center", type=parse_vec3, required=True, metavar="X,Y,Z", help="a point on the thread axis")
+    parser.add_argument("--axis", type=parse_vec3, default=np.array([0.0, 0.0, 1.0]), metavar="AX,AY,AZ",
+                        help="axis direction (default 0,0,1)")
+    parser.add_argument("--u", type=parse_vec3, default=None, metavar="UX,UY,UZ",
+                        help="direction of angle 0 (projected; default as in slice, +X for a Z axis)")
+    parser.add_argument("--range", type=parse_window_pair, default=None, metavar="T0,T1",
+                        help="axial stretch to measure (default: all material around the axis; "
+                             "entry chamfers are recognised and skipped)")
+    parser.add_argument("--rmax", type=float, default=15, help="ignore surfaces farther than this from the axis")
+    parser.add_argument("--step", type=float, default=0.01, help="axial sample step (mm)")
+    parser.add_argument("--angles", type=int, default=8, help="number of evenly spaced ray angles")
+    parser.add_argument("--ref", type=float, default=None,
+                        help="axial position for crest_angle_at_ref (default: middle of --range)")
+    parser.add_argument("--tol", type=float, default=0.002, help="profile simplification tolerance (mm)")
+    parser.add_argument("--shift", type=parse_vec3, default=None, metavar="X,Y,Z",
+                        help="translate the mesh by this first")
+    parser.add_argument("--decimals", type=int, default=4, help="output rounding")
+    parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
+    add_define_option(parser)
+    args = parser.parse_args(glue_vector_values(argv, {"--center", "--axis", "--u", "--range", "--shift"}))
+    dec = args.decimals
+
+    triangles = transformed(load_mesh(args.stl, pathlib.Path.cwd(), args.define), args.shift)
+    frame = slice_frame(args.axis, args.u)
+    u, v, axis = frame
+    if args.range is None:
+        rel = triangles.reshape(-1, 3) - args.center
+        t_all = rel @ axis
+        near = np.linalg.norm(rel - t_all[:, None] * axis, axis=1) < args.rmax
+        if not near.any():
+            sys.exit(f"no mesh vertex within --rmax {args.rmax} of the axis: check --center/--axis or raise --rmax")
+        t0, t1 = t_all[near].min() + 0.02, t_all[near].max() - 0.02
+    else:
+        t0, t1 = args.range
+    ts = np.arange(t0, t1 + args.step / 2, args.step)
+    angles = np.arange(args.angles) * 360.0 / args.angles
+    r = radial_hits(triangles, args.center, frame, ts, angles, args.rmax)
+    if not np.isfinite(r).any():
+        sys.exit(f"no surface within --rmax {args.rmax} of the axis in t = {t0:g}..{t1:g}")
+
+    r_lo = float(np.nanpercentile(r, 0.5))
+    r_hi = plateau_radius(r, r_lo)
+    band = max(0.003, 0.02 * (r_hi - r_lo))
+    profiles = [profile_segments(ts, r[:, j], args.tol, r_lo, r_hi, band) for j in range(len(angles))]
+    # a chamfer inside the root radius looks like a flank: real flanks share one slope
+    slopes = [abs(s1 - s0) for _, segs in profiles for kind, s0, s1 in segs if kind == "flank"]
+    typical = np.median(slopes) if slopes else None
+    per_angle, widths = [], {"crest": [], "root": [], "flank": [], "beyond": []}
+    for j, a in enumerate(angles):
+        pts, segs = profiles[j]
+        if typical:
+            segs = [("beyond" if kind == "flank" and abs(abs(s1 - s0) - typical) > 0.2 * typical else kind, s0, s1)
+                    for kind, s0, s1 in segs]
+        crests, roots = [], []
+        for i, (kind, s0, s1) in enumerate(segs):
+            # a run is whole only with thread on both sides: not at the range ends, not next to a chamfer
+            whole = 0 < i < len(segs) - 1 and segs[i - 1][0] != "beyond" and segs[i + 1][0] != "beyond"
+            if whole:
+                widths[kind].append(s1 - s0)
+                if kind == "crest":
+                    crests.append((s0 + s1) / 2)
+                if kind == "root":
+                    roots.append((s0 + s1) / 2)
+        per_angle.append({"angle": a, "crest_centers": crests, "root_centers": roots, "profile": pts})
+
+    crest_flat = float(np.median(widths["crest"])) if widths["crest"] else None
+    root_flat = float(np.median(widths["root"])) if widths["root"] else None
+    flank_axial = float(np.median(widths["flank"])) if widths["flank"] else None
+    gaps = [g for p in per_angle for key in ("crest_centers", "root_centers") for g in np.diff(p[key])]
+    pitch = float(np.median(gaps)) if gaps else None
+    if pitch is None and crest_flat is not None and root_flat is not None and flank_axial is not None:
+        pitch = crest_flat + root_flat + 2 * flank_axial  # one period holds each run once
+
+    # follow one crest around: at each next angle take the crest centre nearest to the last one;
+    # a root centre half a pitch away stands in where an angle has no whole crest
+    result_phase = {}
+    track = []  # (angle, crest centre); angles with no whole run are skipped
+    ref = (t0 + t1) / 2 if args.ref is None else args.ref
+    for p in per_angle:
+        c = np.array(p["crest_centers"] + ([x + pitch / 2 for x in p["root_centers"]] if pitch else []))
+        if not len(c):
+            continue
+        target = ref if not track else track[-1][1]
+        if pitch:  # a crest one pitch away is the same thread: compare modulo the pitch
+            c = c + pitch * np.round((target - c) / pitch)
+        track.append((p["angle"], float(c[np.argmin(np.abs(c - target))])))
+    lead = starts = handed = None
+    if len(track) >= 2:
+        slope, at_zero = np.polyfit([a for a, _ in track], [t for _, t in track], 1)  # mm per degree
+        lead = float(slope * 360)
+        handed = "right" if slope > 0 else "left"
+        starts = int(round(abs(lead) / pitch)) if pitch else None
+        period = 360.0 / starts if starts else 360.0
+        result_phase = {"crest_center_at_0deg": rnd(at_zero, dec), "ref": rnd(ref, dec),
+                        "crest_angle_at_ref": rnd(((ref - at_zero) / slope) % period, 2),
+                        "repeats_every_deg": rnd(period, 2)}
+    depth = r_hi - r_lo
+    result = {
+        "source": str(args.stl),
+        "axis": {"center": rnd(args.center, dec), "direction": rnd(axis, dec), "u": rnd(u, dec)},
+        "range": rnd([t0, t1], dec), "step": args.step, "angles": rnd(angles, 3),
+        "minor_radius": rnd(r_lo, dec), "major_radius": rnd(r_hi, dec), "depth": rnd(depth, dec),
+        "pitch": rnd(pitch, dec) if pitch else None, "lead": rnd(lead, dec) if lead else None,
+        "starts": starts, "handedness": handed,
+        "crest_flat": rnd(crest_flat, dec) if crest_flat is not None else None,
+        "root_flat": rnd(root_flat, dec) if root_flat is not None else None,
+        "flank_axial": rnd(flank_axial, dec) if flank_axial is not None else None,
+        "flank_angle_deg": rnd(np.degrees(np.arctan2(flank_axial, depth)), 2) if flank_axial else None,
+        **result_phase,
+        "profile_0deg": rnd(per_angle[0]["profile"], dec),
+        "crest_centers_by_angle": [{"angle": rnd(p["angle"], 3), "t": rnd(p["crest_centers"], dec)}
+                                   for p in per_angle],
+    }
+    write_json(result, args.out)
+
+
 # ---- compare ---------------------------------------------------------------
+
+def axis_plane(axis, value):
+    """origin, normal, u of an axis-aligned plane, framed so (u, v) is (y, z) for X, (x, z) for Y
+    and (x, y) for Z."""
+    origin = np.zeros(3)
+    origin[axis] = value
+    normal, u = {0: ([1.0, 0, 0], [0, 1.0, 0]), 1: ([0, -1.0, 0], [1.0, 0, 0]), 2: ([0, 0, 1.0], [1.0, 0, 0])}[axis]
+    return origin, np.array(normal), np.array(u)
+
+
+def loop_summary(loop):
+    return {"kind": loop["kind"], "area": loop["area"], "bounding_box": loop["bounding_box"]}
+
+
+def bbox_iou(a, b):
+    (au, av), (bu, bv) = (a["bounding_box"]["u"], a["bounding_box"]["v"]), (b["bounding_box"]["u"], b["bounding_box"]["v"])
+    iu = max(0.0, min(au[1], bu[1]) - max(au[0], bu[0]))
+    iv = max(0.0, min(av[1], bv[1]) - max(av[0], bv[0]))
+    inter = iu * iv
+    union = (au[1] - au[0]) * (av[1] - av[0]) + (bu[1] - bu[0]) * (bv[1] - bv[0]) - inter
+    return inter / union if union > 0 else float(au == bu and av == bv)
+
+
+def match_loops(la, lb):
+    """Pair loops of the same kind by the largest bounding-box overlap (IoU above 0.5)."""
+    pairs, used = [], set()
+    for i, a in enumerate(la):
+        best = None
+        for j, b in enumerate(lb):
+            if j not in used and a["kind"] == b["kind"]:
+                iou = bbox_iou(a, b)
+                if iou > 0.5 and (best is None or iou > best[0]):
+                    best = (iou, j)
+        if best is not None:
+            used.add(best[1])
+            pairs.append((i, best[1]))
+    return pairs
+
+
+def same_item(x, y, tol):
+    if x["type"] != y["type"]:
+        return False
+    close = lambda p, q: np.linalg.norm(np.subtract(p, q)) <= tol
+    if x["type"] == "circle":
+        return close(x["center"], y["center"]) and abs(x["radius"] - y["radius"]) <= tol
+    ends = (close(x["from"], y["from"]) and close(x["to"], y["to"])) or \
+           (close(x["from"], y["to"]) and close(x["to"], y["from"]))
+    if x["type"] == "line":
+        return ends
+    return ends and close(x["center"], y["center"]) and abs(x["radius"] - y["radius"]) <= tol
+
+
+def compare_slice(meshes, normals, axis, value, args, dec):
+    """Loops of A and B on one plane: net areas, unmatched loops, and per matched loop the
+    area difference and the line/arc items found in only one of the two."""
+    origin, normal, u_hint = axis_plane(axis, value)
+    frame = slice_frame(normal, u_hint)
+    loops = {k: slice_loops(meshes[k], normals[k], origin, frame, args.window, False, args, dec)[0] for k in "ab"}
+    net = {k: sum(l["area"] * (1 if l["kind"] == "outer" else -1 if l["kind"] == "hole" else 0)
+                  for l in loops[k]) for k in "ab"}
+    pairs = match_loops(loops["a"], loops["b"])
+    paired_a, paired_b = {i for i, _ in pairs}, {j for _, j in pairs}
+    diffs = []
+    for i, j in pairs:
+        la, lb = loops["a"][i], loops["b"][j]
+        only_a = [x for x in la["items"] if not any(same_item(x, y, args.match_tol) for y in lb["items"])]
+        only_b = [y for y in lb["items"] if not any(same_item(y, x, args.match_tol) for x in la["items"])]
+        area_diff = lb["area"] - la["area"]
+        if only_a or only_b or abs(area_diff) > args.area_tol:
+            diffs.append({"kind": la["kind"], "bounding_box": la["bounding_box"], "area_a": la["area"],
+                          "area_b": lb["area"], "diff": rnd(area_diff, dec),
+                          "only_a": only_a[:args.max_diffs], "only_b": only_b[:args.max_diffs]})
+    diffs.sort(key=lambda d: -abs(d["diff"]))
+    return {"axis": AXES[axis], "value": value, "frame_u": rnd(frame[0], dec), "frame_v": rnd(frame[1], dec),
+            "net_area_a": rnd(net["a"], dec), "net_area_b": rnd(net["b"], dec),
+            "area_diff": rnd(net["b"] - net["a"], dec),
+            "loop_count_a": len(loops["a"]), "loop_count_b": len(loops["b"]),
+            "unmatched_a": [loop_summary(l) for k, l in enumerate(loops["a"]) if k not in paired_a][:args.max_diffs],
+            "unmatched_b": [loop_summary(l) for k, l in enumerate(loops["b"]) if k not in paired_b][:args.max_diffs],
+            "loop_diffs": diffs[:args.max_diffs]}
+
 
 def compare_main(argv):
     parser = argparse.ArgumentParser(prog="extract_geometry.py compare", description=(
@@ -850,6 +1191,18 @@ def compare_main(argv):
     parser.add_argument("--scan", type=parse_axis_values, default=None, metavar="AXIS=V1[,V2...]")
     parser.add_argument("--profile", type=parse_profile_axis, default=None, metavar="AXIS")
     parser.add_argument("--prominence", type=float, default=0.2)
+    parser.add_argument("--slice", type=parse_axis_values, default=None, metavar="AXIS=V1[,V2...]",
+                        help="also cut both meshes at these planes (as in slice) and diff them loop by loop: "
+                             "unmatched loops, area differences, and the lines/arcs only one side has")
+    parser.add_argument("--window", type=parse_window, default=None, metavar="U0,U1,V0,V1",
+                        help="clip --slice cuts to this box in the plane's (u, v): (y, z) for X, (x, z) for Y, "
+                             "(x, y) for Z")
+    parser.add_argument("--match-tol", type=float, default=0.01,
+                        help="--slice: items whose ends, centers and radii agree within this (mm) match")
+    parser.add_argument("--area-tol", type=float, default=0.001,
+                        help="--slice: report matched loops whose areas differ by more than this (mm^2)")
+    parser.add_argument("--max-diffs", type=int, default=20, help="--slice: cap on each listed diff")
+    add_slice_fit_options(parser)
     parser.add_argument("--shift", type=parse_xyz, default=None, metavar="X,Y,Z", help="translate B by this")
     parser.add_argument("--decimals", type=int, default=4, help="output rounding")
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
@@ -859,7 +1212,7 @@ def compare_main(argv):
         help="extra OpenSCAD variable override for B only, applied after --define "
              "(e.g. compare one .scad against itself under a different -D)",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(glue_vector_values(argv, {"--shift", "--window"}))
     dec = args.decimals
 
     meshes = {
@@ -896,6 +1249,10 @@ def compare_main(argv):
                               "b_minus_a": rnd(ib - ia, dec) if len(ia) == len(ib) else None})
             entry["scan_diffs"] = diffs
             result["sections"].append(entry)
+    if args.slice is not None:
+        mesh_normals = {key: face_normals_and_areas(tris)[0] for key, tris in meshes.items()}
+        axis, values = args.slice
+        result["slices"] = [compare_slice(meshes, mesh_normals, axis, value, args, dec) for value in values]
     write_json(result, args.out)
 
 
@@ -909,13 +1266,20 @@ def faces_main(argv):
     parser.add_argument("--min-area", type=float, default=None,
                         help="drop faces smaller than this area (mm^2), e.g. to skip small holes "
                              "when the full output is too large to read in one go")
+    parser.add_argument("--box", type=parse_box, default=None, metavar="X0,X1,Y0,Y1,Z0,Z1",
+                        help="keep only faces whose bounding box lies inside this box, e.g. the "
+                             "faces of one pocket or boss")
     add_define_option(parser)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(glue_vector_values(argv, {"--box"}))
 
     triangles = load_mesh(args.stl, pathlib.Path.cwd(), args.define)
     faces = extract_faces(triangles, args.decimals)
     if args.min_area is not None:
         faces = [f for f in faces if f["area"] >= args.min_area]
+    if args.box is not None:
+        b = args.box
+        faces = [f for f in faces if all(b[2 * k] <= f["bounding_box"][a][0] and f["bounding_box"][a][1] <= b[2 * k + 1]
+                                         for k, a in enumerate("xyz"))]
 
     result = {
         "source": str(args.stl),
@@ -930,7 +1294,7 @@ def faces_main(argv):
 
 
 def main():
-    commands = {"section": section_main, "slice": slice_main, "compare": compare_main}
+    commands = {"section": section_main, "slice": slice_main, "thread": thread_main, "compare": compare_main}
     if len(sys.argv) > 1 and sys.argv[1] in commands:
         commands[sys.argv[1]](sys.argv[2:])
     else:
