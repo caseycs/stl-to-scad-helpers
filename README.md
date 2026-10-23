@@ -28,10 +28,17 @@ uv run extract_geometry.py model.scad --out geometry.json
 uv run extract_geometry.py slice model.stl --origin 0,0,3.1 --normal 0,0,1 --window -10,10,-10,10 --svg cut.svg
 ```
 
-See [`docs/usage.md`](docs/usage.md) for full options (focus boxes,
-`section`/`slice`/`compare` subcommands, `--define` for `.scad` variables) and how
-view-angle filenames decode. See [`SKILL.md`](SKILL.md) to use this as a
-Claude Code skill.
+Each command takes `--help` for its flags. See [`docs/usage.md`](docs/usage.md)
+for what the outputs mean (face frames, `section`/`slice`/`compare` fields, how
+view-angle filenames decode) and [`SKILL.md`](SKILL.md) for the step-by-step
+STL → OpenSCAD replication workflow.
+
+## Installing as a Claude Code skill
+
+Clone this repo into a skills directory Claude Code reads from (e.g.
+`~/.claude/skills/stl-to-scad-helpers` or a project's `.claude/skills/`), or
+add it as a plugin marketplace/skill source. No build step: the scripts run
+as-is via `uv run`.
 
 ## Requirements
 
