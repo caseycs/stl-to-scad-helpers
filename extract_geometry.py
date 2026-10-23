@@ -66,22 +66,45 @@ def face_normals_and_areas(triangles):
 def group_coplanar(triangles, normals, areas, normal_tol=2e-3, offset_tol=0.02):
     # Greedy clustering, largest triangle first: a triangle joins a plane when
     # its normal is within normal_tol (per component) and all its vertices lie
-    # within offset_tol of that plane. offset_tol=inf groups by normal only.
-    rep_n, rep_d = np.empty((0, 3)), np.empty(0)
+    # within offset_tol of that plane (the earliest such plane wins).
+    # offset_tol=inf groups by normal only.
+    # Planes are bucketed by normal into cells of size normal_tol, so a
+    # candidate within normal_tol is always in one of the 27 neighbouring cells.
+    check_offset = np.isfinite(offset_tol)
+    cells = np.floor(normals / normal_tol).astype(int).tolist()
+    normals_l, tris_l = normals.tolist(), triangles.tolist()
+    rep_n, rep_d, buckets = [], [], {}
+    neighbours = [(a, b, c) for a in (-1, 0, 1) for b in (-1, 0, 1) for c in (-1, 0, 1)]
     group = np.empty(len(triangles), dtype=int)
-    for i in np.argsort(-areas, kind="stable"):
-        close = np.abs(rep_n - normals[i]).max(axis=1) < normal_tol
-        if np.isfinite(offset_tol):
-            dist = np.abs(triangles[i] @ rep_n.T - rep_d).max(axis=0)
-            close &= dist < offset_tol
-        hits = np.flatnonzero(close)
-        if len(hits):
-            group[i] = hits[0]
-        else:
-            group[i] = len(rep_n)
-            rep_n = np.vstack([rep_n, normals[i]])
-            rep_d = np.append(rep_d, normals[i] @ triangles[i, 0])
+    for i in np.argsort(-areas, kind="stable").tolist():
+        (nx, ny, nz), (cx, cy, cz) = normals_l[i], cells[i]
+        best = None
+        for dx, dy, dz in neighbours:
+            for r in buckets.get((cx + dx, cy + dy, cz + dz), ()):
+                if best is not None and r > best:
+                    continue
+                rx, ry, rz = rep_n[r]
+                if abs(rx - nx) >= normal_tol or abs(ry - ny) >= normal_tol or abs(rz - nz) >= normal_tol:
+                    continue
+                if check_offset and any(abs(rx * x + ry * y + rz * z - rep_d[r]) >= offset_tol
+                                        for x, y, z in tris_l[i]):
+                    continue
+                best = r
+        if best is None:
+            best = len(rep_n)
+            x, y, z = tris_l[i][0]
+            rep_n.append((nx, ny, nz))
+            rep_d.append(nx * x + ny * y + nz * z)
+            buckets.setdefault((cx, cy, cz), []).append(best)
+        group[i] = best
     return group
+
+
+def split_groups(group_ids):
+    """(group id, triangle indices) per group, in increasing group id order."""
+    order = np.argsort(group_ids, kind="stable")
+    ids, starts = np.unique(group_ids[order], return_index=True)
+    return zip(ids.tolist(), np.split(order, starts[1:]))
 
 
 # (u, v) for the six axis-aligned normals, world-axis-aligned so e.g. a +Z face's
@@ -153,8 +176,7 @@ def extract_faces(triangles, decimals=4):
     group_ids = group_coplanar(triangles, normals, areas)
 
     faces = []
-    for g in np.unique(group_ids):
-        mask = group_ids == g
+    for g, mask in split_groups(group_ids):
         group_tris = tri_vert_ids[mask]
         normal = (normals[mask] * areas[mask, None]).sum(axis=0)
         normal /= np.linalg.norm(normal)
@@ -180,7 +202,7 @@ def extract_faces(triangles, decimals=4):
             "normal": rnd(normal, decimals),
             "plane_offset": rnd(offset, decimals),
             "area": rnd(areas[mask].sum(), decimals),
-            "triangle_count": int(mask.sum()),
+            "triangle_count": len(mask),
             "bounding_box": bbox(pts, decimals),
             # points_2d = origin + u*p[0] + v*p[1] in model coordinates
             "frame": {"origin": rnd(origin, decimals), "u": rnd(u, decimals), "v": rnd(v, decimals)},
@@ -473,10 +495,9 @@ def compare_main(argv):
     group = group_coplanar(both, normals, areas, args.normal_tol, np.inf)
     from_b = np.arange(len(both)) >= len(meshes["a"])
     rows = []
-    for g in np.unique(group):
-        m = group == g
+    for _, m in split_groups(group):
         n = (normals[m] * areas[m, None]).sum(axis=0)
-        area_a, area_b = areas[m & ~from_b].sum(), areas[m & from_b].sum()
+        area_a, area_b = areas[m[~from_b[m]]].sum(), areas[m[from_b[m]]].sum()
         rows.append({"normal": rnd(n / np.linalg.norm(n), dec), "area_a": rnd(area_a, dec),
                      "area_b": rnd(area_b, dec), "diff": rnd(area_b - area_a, dec)})
     result["area_by_normal"] = sorted(rows, key=lambda r: -max(r["area_a"], r["area_b"]))
