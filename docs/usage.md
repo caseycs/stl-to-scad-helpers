@@ -119,6 +119,11 @@ starting at `u` (`+X` for a `+Z` axis); `t` is measured along the axis from
   Flats are only measured between two thread runs, so a thread with less
   than about two pitches of length reports `null` pitch or phase: lengthen
   `--range` or add `--angles`.
+- The bore need not be round (an octagon, a slot through it): crest and root
+  radii are found per ray, rays that see no thread (a constant radius, or
+  nothing) are left out, and the flats come from the rays whose crest sits at
+  `minor_radius`. A crest split by another feature (a notch) is dropped as off
+  the helix rather than bending `lead`.
 
 ## compare
 

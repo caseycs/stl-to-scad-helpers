@@ -1060,25 +1060,45 @@ def thread_main(argv):
     if not np.isfinite(r).any():
         sys.exit(f"no surface within --rmax {args.rmax} of the axis in t = {t0:g}..{t1:g}")
 
-    r_lo = float(np.nanpercentile(r, 0.5))
-    r_hi = plateau_radius(r, r_lo)
-    band = max(0.003, 0.02 * (r_hi - r_lo))
-    profiles = [profile_segments(ts, r[:, j], args.tol, r_lo, r_hi, band) for j in range(len(angles))]
+    # crest and root radii per ray: in a non-round bore (an octagon, a slot) the crest radius
+    # varies with the angle, and rays that miss the thread see one constant radius all along,
+    # which would outvote the real root plateau in a histogram over all rays
+    seen = np.isfinite(r).any(axis=0)
+    ray_lo = np.array([np.nanpercentile(r[:, j], 0.5) if seen[j] else np.nan for j in range(len(angles))])
+    ray_hi = np.array([plateau_radius(r[:, j], ray_lo[j]) if seen[j] else np.nan for j in range(len(angles))])
+    ray_depth = ray_hi - ray_lo
+    threaded = seen & (np.nan_to_num(ray_depth) > max(0.02, 0.25 * np.nanmax(ray_depth)))
+    if not threaded.any():
+        sys.exit(f"no thread in t = {t0:g}..{t1:g}: every ray sees a constant radius")
+    r_lo = float(ray_lo[threaded].min())
+    r_hi = float(np.median(ray_hi[threaded]))
+    profiles = []
+    for j in range(len(angles)):
+        pts, segs = profile_segments(ts, r[:, j], args.tol, ray_lo[j], ray_hi[j],
+                                     max(0.003, 0.02 * ray_depth[j]) if threaded[j] else 0.003)
+        profiles.append((pts, segs if threaded[j] else []))
+    # rays whose crest sits at the minor radius show the true profile; in a non-round bore the
+    # others cut the thread higher up its flanks (longer crests, shorter flanks)
+    full = threaded & (np.nan_to_num(ray_lo, nan=np.inf) <= r_lo + max(0.003, 0.02 * (r_hi - r_lo)))
     # a chamfer inside the root radius looks like a flank: real flanks share one slope
-    slopes = [abs(s1 - s0) for _, segs in profiles for kind, s0, s1 in segs if kind == "flank"]
+    slopes = [abs(s1 - s0) for j, (_, segs) in enumerate(profiles) if full[j]
+              for kind, s0, s1 in segs if kind == "flank"]
     typical = np.median(slopes) if slopes else None
     per_angle, widths = [], {"crest": [], "root": [], "flank": [], "beyond": []}
     for j, a in enumerate(angles):
         pts, segs = profiles[j]
-        if typical:
-            segs = [("beyond" if kind == "flank" and abs(abs(s1 - s0) - typical) > 0.2 * typical else kind, s0, s1)
-                    for kind, s0, s1 in segs]
+        own = [abs(s1 - s0) for kind, s0, s1 in segs if kind == "flank"]
+        ray_typical = typical if full[j] else np.median(own) if own else None
+        if ray_typical:
+            segs = [("beyond" if kind == "flank" and abs(abs(s1 - s0) - ray_typical) > 0.2 * ray_typical
+                     else kind, s0, s1) for kind, s0, s1 in segs]
         crests, roots = [], []
         for i, (kind, s0, s1) in enumerate(segs):
             # a run is whole only with thread on both sides: not at the range ends, not next to a chamfer
             whole = 0 < i < len(segs) - 1 and segs[i - 1][0] != "beyond" and segs[i + 1][0] != "beyond"
             if whole:
-                widths[kind].append(s1 - s0)
+                if full[j]:
+                    widths[kind].append(s1 - s0)
                 if kind == "crest":
                     crests.append((s0 + s1) / 2)
                 if kind == "root":
@@ -1093,22 +1113,29 @@ def thread_main(argv):
     if pitch is None and crest_flat is not None and root_flat is not None and flank_axial is not None:
         pitch = crest_flat + root_flat + 2 * flank_axial  # one period holds each run once
 
-    # follow one crest around: at each next angle take the crest centre nearest to the last one;
-    # a root centre half a pitch away stands in where an angle has no whole crest
+    # lead: crest centres (and root centres half a pitch off) on all rays, modulo the pitch, line
+    # up only for the right lead. Try each lead of 1..6 starts, either hand, and keep the one
+    # whose phases cluster tightest; then fit it, dropping centres off the helix (a crest split
+    # by another feature). Gaps between rays don't matter, unlike following one crest around.
     result_phase = {}
-    track = []  # (angle, crest centre); angles with no whole run are skipped
     ref = (t0 + t1) / 2 if args.ref is None else args.ref
-    for p in per_angle:
-        c = np.array(p["crest_centers"] + ([x + pitch / 2 for x in p["root_centers"]] if pitch else []))
-        if not len(c):
-            continue
-        target = ref if not track else track[-1][1]
-        if pitch:  # a crest one pitch away is the same thread: compare modulo the pitch
-            c = c + pitch * np.round((target - c) / pitch)
-        track.append((p["angle"], float(c[np.argmin(np.abs(c - target))])))
+    obs = np.array([(p["angle"], c) for p in per_angle
+                    for c in p["crest_centers"] + ([x + pitch / 2 for x in p["root_centers"]] if pitch else [])])
     lead = starts = handed = None
-    if len(track) >= 2:
-        slope, at_zero = np.polyfit([a for a, _ in track], [t for _, t in track], 1)  # mm per degree
+    if pitch and len(obs) and len(np.unique(obs[:, 0])) >= 2:
+        a_obs, c_obs = obs[:, 0], obs[:, 1]
+
+        def spread(trial):  # phases as unit vectors: length of their mean, 1 = all equal
+            return abs(np.exp(2j * np.pi * (c_obs - trial * a_obs / 360) / pitch).mean())
+        trials = [h * n * pitch for n in range(1, 7) for h in (1, -1)]
+        trial = max(trials, key=lambda x: spread(x) - 1e-6 * abs(x))  # ties: fewest starts
+        phase = np.angle(np.exp(2j * np.pi * (c_obs - trial * a_obs / 360) / pitch).mean()) / (2 * np.pi) * pitch
+        res = (c_obs - trial * a_obs / 360 - phase + pitch / 2) % pitch - pitch / 2
+        keep = np.abs(res) < pitch / 6
+        if len(np.unique(a_obs[keep])) < 2:
+            keep[:] = True
+        slope, at_zero = np.polyfit(a_obs[keep], (trial * a_obs / 360 + phase + res)[keep], 1)  # mm per degree
+        at_zero += pitch * np.round((ref - at_zero) / pitch)  # the crest on the 0 deg ray nearest ref
         lead = float(slope * 360)
         handed = "right" if slope > 0 else "left"
         starts = int(round(abs(lead) / pitch)) if pitch else None
