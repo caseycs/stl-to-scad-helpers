@@ -3,11 +3,17 @@
 Flags and defaults: `uv run <script>.py [subcommand] --help`. This file covers
 what the outputs mean. STL input may be binary or ASCII.
 
-`--brief` (faces, slice, compare) prints the same result as compact text, one
-line per face, loop, item or diff, instead of JSON: `L from -> to` for a line,
-`A from -> to c center r radius ccw|cw` for an arc, `C center r radius` for a
-circle. Read it directly; reach for the JSON only for fields `--brief` leaves
-out (face loop points, section profiles).
+`--brief` (faces, slice, compare) prints the result as compact text instead
+of JSON, one line per face, loop, item or diff; each command's section below
+says what it keeps. Shared formats:
+
+- Mesh health: `volume V sign S watertight yes|no bad_edges N triangles N
+  bbox x [..] y [..] z [..]` (`sign` is `volume_sign`), then one indented
+  `KIND edges N at (x, y, z)` line per `bad_edges` cluster.
+- Loop items: `L from -> to` for a line, `A from -> to c center r radius
+  ccw|cw` for an arc, `C center r radius` for a circle.
+
+Read it directly; reach for the JSON only for what `--brief` leaves out.
 
 ## render_views.py
 
@@ -53,6 +59,10 @@ largest area first.
   built on all cores.
 - `--stats` prints only the top level above, without `faces`, and skips the
   plane grouping entirely.
+- `--brief`: the health line, then per face `id area n (normal) offset bbox
+  outer N hole N`, and under a face with holes an indented `hole centres`
+  line (each the mean of the hole's points). Leaves out the loops' points
+  and frames.
 
 A face is every triangle on one plane (normal within 2e-3, offset within
 0.02 mm), so one plane with separate regions has several `outer` loops.
@@ -98,6 +108,9 @@ off a vertex (stderr warning):
   several short arcs or lines.
 - `--window` clips to a `(u, v)` box; `--within` keeps whole loops inside it
   instead. `--svg` draws outer blue, holes red, open chains grey.
+- `--brief`: a `frame` line, then per loop `KIND area A u [..] v [..]`
+  followed by its items, one per line; the `--scad` snippet last. Leaves out
+  `raw_points` and the arcs' start/end angles.
 
 ## thread
 
@@ -130,6 +143,9 @@ starting at `u` (`+X` for a `+Z` axis); `t` is measured along the axis from
   nothing) are left out, and the flats come from the rays whose crest sits at
   `minor_radius`. A crest split by another feature (a notch) is dropped as off
   the helix rather than bending `lead`.
+- To cut the thread in OpenSCAD, [`helix_groove.scad`](helix_groove.scad)
+  takes these numbers; its header maps each argument to a field (the groove
+  centre is `crest_center_at_0deg + pitch / 2`).
 
 ## compare
 
@@ -158,3 +174,10 @@ A negative scale mirrors (`-1,1,1`: x -> -x) and two make a 180° turn
   the lines/arcs with no partner within `--match-tol` (ends, centre and
   radius). Arcs fitted along a spiral edge (a thread) differ run to run, so
   expect a few matched-area loops listing arcs there.
+- `--brief`: `a:` and `b:` health lines, `volume_diff`, then the
+  `area_by_normal` rows differing by more than `--area-tol`, largest first
+  (at most `--max-diffs`); per scan line `cut … scan …: b-a [..]`, or both
+  sides' intervals when the counts differ; per slice a summary line, each
+  loop diff with its `only_a`/`only_b` items, and each unmatched loop as
+  `only_a`/`only_b KIND area …`. Leaves out the sections' raw cuts and
+  profiles.
