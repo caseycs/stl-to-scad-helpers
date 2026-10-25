@@ -9,19 +9,21 @@ number you write into OpenSCAD traces back to tool output.
 
 Run the scripts as `uv run <this skill's absolute dir>/<script>.py`. Work from
 a scratch directory: a `.scad` input is exported to
-`<name>.scad-export.stl` in the current directory.
+`<name>.scad-export.stl` in the current directory. Pass `--brief` to `faces`,
+`slice` and `compare` and read their text output directly, instead of
+writing a script to summarise the JSON.
 
 ## Tools
 
 | Command | Gives you |
 | --- | --- |
 | `render_views.py MODEL --step 90 [--focus=X0,X1,Y0,Y1,Z0,Z1]` | PNGs from many angles, one color per surface orientation |
-| `extract_geometry.py MODEL --min-area A [--box X0,X1,Y0,Y1,Z0,Z1] --out geo.json` | health (`watertight`, `volume`, `bounding_box`, where any `bad_edges` are) + every flat face: normal, offset, outline and hole loops; `--box` keeps one feature's faces |
+| `extract_geometry.py MODEL --min-area A [--box X0,X1,Y0,Y1,Z0,Z1] --brief` | health (`watertight`, `volume`, `bounding_box`, where any `bad_edges` are) + every flat face: normal, offset, bbox, hole centres; `--box` keeps one feature's faces; JSON (no `--brief`) adds the loops' points |
 | `extract_geometry.py MODEL --stats` | health only, no faces: seconds even on a million-triangle mesh |
 | `extract_geometry.py slice MODEL --origin P --normal N [--window U0,U1,V0,V1 [--within]] [--scad]` | cross-section on any plane as lines/arcs/circles (centers, radii), optional `polygon()` |
 | `extract_geometry.py thread MODEL --center P [--axis A] [--rmax R]` | a threaded hole: minor/major radius, pitch, lead, starts, hand, crest/root flats, flank angle, phase |
 | `extract_geometry.py section MODEL --cut Y=a,b --scan Z=c,d [--profile X]` | material intervals along scan lines; peaks/troughs of a cut's boundary |
-| `extract_geometry.py compare A B [--cut … --scan …] [--slice Z=a,b [--window …]]` | volume, bbox and area-per-normal diffs (B − A), section diffs; `--slice` diffs cuts loop by loop down to the lines/arcs only one side has |
+| `extract_geometry.py compare A B [--scale SX,SY,SZ] [--cut … --scan …] [--slice Z=a,b [--window …]]` | volume, bbox and area-per-normal diffs (B − A), section diffs; `--slice` diffs cuts loop by loop down to the lines/arcs only one side has; `--scale` mirrors or turns B first |
 
 Flags: `--help` on each command. Output fields, frames and camera angles:
 [`docs/usage.md`](docs/usage.md).
@@ -33,49 +35,28 @@ Flags: `--help` on each command. Output fields, frames and camera angles:
    body, every feature type (through-hole, pocket, boss, chamfer, thread,
    slot) and every repeated pattern.
 
-2. **Measure the envelope.** `extract_geometry.py MODEL --min-area A --out geo.json`.
-   Pick `A` so the file holds tens to a few hundred faces: curved surfaces
-   split into thousands of tiny faces (a 224k-triangle plate gave 146k faces
-   and 210 MB at the default). Read it through a summary, never whole:
+2. **Measure the envelope.** `extract_geometry.py MODEL --min-area A --brief`.
+   Pick `A` so it lists tens to a few hundred faces: curved surfaces split
+   into thousands of tiny faces (a 224k-triangle plate gave 146k faces at the
+   default). Done when you have the bounding box, a watertight mesh with
+   `sign 1` (otherwise note where it's broken), and the distinct plane offsets
+   per axis (the step heights).
 
-   ```
-   python3 -c '
-   import json, sys
-   g = json.load(open(sys.argv[1]))
-   print({k: v for k, v in g.items() if k != "faces"})
-   for f in g["faces"][:40]:
-       k = [l["kind"] for l in f["loops"]]
-       print(f["id"], f["area"], f["normal"], f["plane_offset"], f["bounding_box"], "outer", k.count("outer"), "holes", k.count("hole"))
-   ' geo.json
-   ```
-
-   Done when you have the bounding box, a watertight mesh with
-   `volume_sign` 1 (otherwise note where it's broken), and the distinct plane
-   offsets per axis (the step heights).
-
-3. **Find patterns.** Hole-loop centers of the large faces give counts and
-   pitch:
-
-   ```
-   python3 -c '
-   import json, sys
-   f = next(f for f in json.load(open(sys.argv[1]))["faces"] if f["id"] == int(sys.argv[2]))
-   for l in f["loops"]:
-       p = l["points_3d"]; n = len(p)
-       print(l["kind"], n, [round(sum(c[i] for c in p) / n, 3) for i in range(3)])
-   ' geo.json FACE_ID
-   ```
-
-   Done when each repeated feature has a count, a pitch, and an origin.
+3. **Find patterns.** The `hole centres` under each large face give counts
+   and pitch. Done when each repeated feature has a count, a pitch, and an
+   origin.
 
 4. **Plan the CSG.** List base body + features, each as an OpenSCAD
    primitive and the tool that will measure it:
-   - axis-aligned outline or straight-edged hole → face loops (`points_3d`)
+   - axis-aligned outline or straight-edged hole → face loops (`points_3d`
+     in the JSON, `--box` around the feature)
    - round or sloped feature → `slice` at mid-height of the
      feature, `--window` around one instance (`--within` for whole loops);
      arcs give center and radius, `--scad` gives a `polygon()`
    - threaded hole → `thread` on its axis; check its phase on a second
-     instance (`crest_angle_at_ref` at the same `--ref`)
+     instance (`crest_angle_at_ref` at the same `--ref`); cut it with
+     [`docs/helix_groove.scad`](docs/helix_groove.scad), whose arguments map
+     onto `thread`'s output
    - heights, wall thickness, chamfers, depths → `section --scan` intervals
      and `--profile`
 
@@ -105,6 +86,21 @@ Flags: `--help` on each command. Output fields, frames and camera angles:
 
 For a single measurement or a diff, run just the matching step's tool.
 
+## A variant of a replicated part
+
+When a second STL looks like a mirrored, turned or slightly changed copy of
+one already replicated, diff it against the first before measuring anything:
+
+1. Find the transform: `compare FIRST VARIANT --scale … --shift … --brief`
+   with the bounding boxes lined up (`--scale -1,1,1` mirrors in X,
+   `-1,-1,1` turns 180° about Z). Done when the `area_by_normal` diffs are
+   down to the changed features.
+2. Locate the changes: `--slice` on each axis through the part; the
+   `only_a`/`only_b` loops and items are the differences, the rest is
+   shared.
+3. Measure only those, add them to the first SCAD behind a `part = N`
+   switch, and verify each part against its own STL as in step 7.
+
 ## Gotchas
 
 - `points_2d` are relative to the face's `frame.origin` (a vertex of the face),
@@ -116,3 +112,8 @@ For a single measurement or a diff, run just the matching step's tool.
   Negative values need the `=` form (`--focus=-40,40,…`).
 - Render colors encode orientation only: parallel faces at different heights
   share a color.
+- `over-shared` bad edges in your own SCAD's export: two solids touch along an
+  edge or at a vertex. Overlap them (extend one into the other by ~1 mm).
+- A hand-written `polyhedron()` wound the wrong way is inside out:
+  `volume_diff` jumps by about the feature's own volume and the mesh is not
+  watertight. Reverse each face's vertex order.
