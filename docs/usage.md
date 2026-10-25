@@ -1,7 +1,13 @@
 # Output reference
 
 Flags and defaults: `uv run <script>.py [subcommand] --help`. This file covers
-what the outputs mean.
+what the outputs mean. STL input may be binary or ASCII.
+
+`--brief` (faces, slice, compare) prints the same result as compact text, one
+line per face, loop, item or diff, instead of JSON: `L from -> to` for a line,
+`A from -> to c center r radius ccw|cw` for an arc, `C center r radius` for a
+circle. Read it directly; reach for the JSON only for fields `--brief` leaves
+out (face loop points, section profiles).
 
 ## render_views.py
 
@@ -127,7 +133,9 @@ starting at `u` (`+X` for a `+Z` axis); `t` is measured along the axis from
 
 ## compare
 
-`--mirror-x` then `--shift` apply to B only; there is no auto-alignment.
+`--scale SX,SY,SZ` then `--shift` apply to B only; there is no auto-alignment.
+A negative scale mirrors (`-1,1,1`: x -> -x) and two make a 180° turn
+(`-1,-1,1`: about Z), so a part's mirrored or turned variant lines up with it.
 `--define` applies to both models, `--define-b` adds an override for B only
 (compare one `.scad` under two `-D` values).
 

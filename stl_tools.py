@@ -1,7 +1,8 @@
-"""Shared helpers for render_views.py and extract_geometry.py: binary STL
-loading and .scad -> STL export through the openscad CLI."""
+"""Shared helpers for render_views.py and extract_geometry.py: STL loading
+(binary or ASCII) and .scad -> STL export through the openscad CLI."""
 import argparse
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -13,19 +14,19 @@ STL_RECORD = np.dtype([
 ])
 
 
-def load_binary_stl(path):
+def load_stl(path):
+    """Triangles (n, 3, 3) from a binary or ASCII STL."""
     data = pathlib.Path(path).read_bytes()
-    if len(data) < 84:
-        sys.exit(f"{path}: too small to be a binary STL ({len(data)} bytes)")
-    count = int(np.frombuffer(data, "<u4", 1, 80)[0])
-    expected = 84 + 50 * count
-    if len(data) != expected:
-        hint = (" (looks like an ASCII STL - export/convert to binary first, "
-                 "e.g. `openscad --export-format binstl`)" if data[:5] == b"solid" else "")
-        sys.exit(f"{path}: not a binary STL (expected {expected} bytes for {count} "
-                  f"triangles, got {len(data)}){hint}")
-    records = np.frombuffer(data, STL_RECORD, count, 84)
-    return records["v"].astype(np.float64)
+    if len(data) >= 84:
+        count = int(np.frombuffer(data, "<u4", 1, 80)[0])
+        if len(data) == 84 + 50 * count:
+            return np.frombuffer(data, STL_RECORD, count, 84)["v"].astype(np.float64)
+    # a binary header may also start with "solid", so the size check above comes first
+    if data.lstrip()[:5] == b"solid":
+        coords = re.findall(rb"vertex\s+(\S+)\s+(\S+)\s+(\S+)", data)
+        if coords and len(coords) % 3 == 0:
+            return np.array(coords).astype(np.float64).reshape(-1, 3, 3)
+    sys.exit(f"{path}: neither a binary nor an ASCII STL ({len(data)} bytes)")
 
 
 def parse_define(text):
@@ -63,4 +64,4 @@ def load_mesh(path, scad_out_dir, defines=()):
         # distinct suffix so this never silently overwrites a real same-named .stl
         out = pathlib.Path(scad_out_dir) / f"{path.stem}.scad-export.stl"
         path = export_scad_to_stl(path, out, defines)
-    return load_binary_stl(path)
+    return load_stl(path)

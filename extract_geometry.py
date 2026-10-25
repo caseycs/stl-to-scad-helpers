@@ -5,7 +5,7 @@
 #   "numpy",
 # ]
 # ///
-"""Extract structured planar-face geometry from a binary STL file as JSON.
+"""Extract structured planar-face geometry from an STL file as JSON.
 
 Pixel renders are good for a sanity check but a vision model can't read
 exact dimensions off them. This instead groups triangles into flat
@@ -460,9 +460,11 @@ def section_cut(triangles, normals, axis, value, scan, profile, prominence, deci
     return result
 
 
-def transformed(triangles, shift=None, mirror_x=False):
-    if mirror_x:
-        triangles = triangles[:, [0, 2, 1]] * np.array([-1.0, 1.0, 1.0])  # mirror and keep normals outward
+def transformed(triangles, shift=None, scale=None):
+    if scale is not None:
+        triangles = triangles * scale
+        if np.prod(scale) < 0:  # a mirror turns the winding inside out
+            triangles = triangles[:, [0, 2, 1]]
     if shift is not None:
         triangles = triangles + shift
     return triangles
@@ -505,10 +507,64 @@ def write_json(result, out):
         print(f"written to {out}", file=sys.stderr)
 
 
+def num(x, dec):
+    text = f"{x:.{dec}f}".rstrip("0").rstrip(".")
+    return "0" if text in ("", "-0") else text
+
+
+def vec(values, dec):
+    return "(" + ", ".join(num(x, dec) for x in values) + ")"
+
+
+def span(values, dec):
+    return "[" + ", ".join(num(x, dec) for x in values) + "]"
+
+
+def bbox_text(box, dec):
+    return " ".join(f"{a} {span(box[a], dec)}" for a in AXES)
+
+
+def item_text(item, dec):
+    if item["type"] == "line":
+        return f"L {vec(item['from'], dec)} -> {vec(item['to'], dec)}"
+    if item["type"] == "circle":
+        return f"C {vec(item['center'], dec)} r {num(item['radius'], dec)}"
+    return (f"A {vec(item['from'], dec)} -> {vec(item['to'], dec)} c {vec(item['center'], dec)} "
+            f"r {num(item['radius'], dec)} {'ccw' if item['ccw'] else 'cw'}")
+
+
+def loop_text(loop, dec):
+    box = loop["bounding_box"]
+    return f"{loop['kind']} area {num(loop['area'], dec)} u {span(box['u'], dec)} v {span(box['v'], dec)}"
+
+
+def stats_lines(stats, dec):
+    """mesh_stats plus bounding_box as one line, then one line per bad-edge cluster."""
+    lines = [f"volume {num(stats['volume'], dec)} sign {stats['volume_sign']} "
+             f"watertight {'yes' if stats['watertight'] else 'no'} bad_edges {stats['bad_edge_count']} "
+             f"triangles {stats['triangle_count']} bbox {bbox_text(stats['bounding_box'], dec)}"]
+    lines += [f"  {e['kind']} edges {e['count']} at {vec(e['center'], dec)}" for e in stats.get("bad_edges", [])]
+    return lines
+
+
+def write_text(lines, out):
+    text = "\n".join(lines)
+    if out is None:
+        print(text)
+    else:
+        out.write_text(text + "\n")
+        print(f"written to {out}", file=sys.stderr)
+
+
+def add_brief_option(parser):
+    parser.add_argument("--brief", action="store_true",
+                        help="print a compact text summary instead of JSON, one line per item")
+
+
 def section_main(argv):
     parser = argparse.ArgumentParser(prog="extract_geometry.py section", description=(
         "Cut a mesh with axis-aligned planes. Values that hit a vertex are nudged by 1e-6 (warning on stderr)."))
-    parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export first")
+    parser.add_argument("stl", type=pathlib.Path, help="STL file (binary or ASCII), or an .scad file to export first")
     add_section_options(parser)
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
     args = parser.parse_args(argv)
@@ -908,7 +964,7 @@ def slice_main(argv):
         "Cut a mesh with an arbitrary plane and return the cross-section as closed loops of "
         "lines and arcs in the plane's own (u, v) coordinates: a point (p, q) is "
         "origin + u*p + v*q. Outer loops run CCW, holes CW (seen from the normal side)."))
-    parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export first")
+    parser.add_argument("stl", type=pathlib.Path, help="STL file (binary or ASCII), or an .scad file to export first")
     parser.add_argument("--origin", type=parse_vec3, required=True, metavar="X,Y,Z",
                         help="a point on the cutting plane; becomes (0, 0) in the output")
     parser.add_argument("--normal", type=parse_vec3, required=True, metavar="NX,NY,NZ",
@@ -929,6 +985,7 @@ def slice_main(argv):
                         help="translate the mesh by this before cutting")
     parser.add_argument("--decimals", type=int, default=4, help="output rounding")
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
+    add_brief_option(parser)
     add_define_option(parser)
     args = parser.parse_args(glue_vector_values(argv, {"--origin", "--normal", "--u", "--window", "--shift"}))
     dec = args.decimals
@@ -947,7 +1004,16 @@ def slice_main(argv):
     if args.svg is not None and loops:
         args.svg.write_text(svg_document(loops, dec))
         print(f"svg written to {args.svg}", file=sys.stderr)
-    write_json(result, args.out)
+    if not args.brief:
+        write_json(result, args.out)
+        return
+    f = result["frame"]
+    lines = [f"frame origin {vec(f['origin'], dec)} u {vec(f['u'], dec)} v {vec(f['v'], dec)}"]
+    for loop in loops:
+        lines += [loop_text(loop, dec)] + ["  " + item_text(item, dec) for item in loop["items"]]
+    if "scad" in result:
+        lines += [result["scad"]]
+    write_text(lines, args.out)
 
 
 # ---- thread ----------------------------------------------------------------
@@ -1019,7 +1085,7 @@ def thread_main(argv):
         "the axis: minor/major radius, pitch, lead, starts, handedness, crest/root flats, flank, "
         "phase, and the axial profile. Angles are measured about the axis from u, counter-"
         "clockwise seen from the axis tip; t is the position along the axis from --center."))
-    parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export first")
+    parser.add_argument("stl", type=pathlib.Path, help="STL file (binary or ASCII), or an .scad file to export first")
     parser.add_argument("--center", type=parse_vec3, required=True, metavar="X,Y,Z", help="a point on the thread axis")
     parser.add_argument("--axis", type=parse_vec3, default=np.array([0.0, 0.0, 1.0]), metavar="AX,AY,AZ",
                         help="axis direction (default 0,0,1)")
@@ -1249,10 +1315,12 @@ def compare_slice(meshes, normals, axis, value, args, dec):
 def compare_main(argv):
     parser = argparse.ArgumentParser(prog="extract_geometry.py compare", description=(
         "Compare two meshes: volume, bounding box, area per normal direction, and optionally "
-        "sections. --mirror-x and --shift apply to B (mirror first); there is no automatic alignment."))
+        "sections. --scale and --shift apply to B (scale first); there is no automatic alignment."))
     parser.add_argument("a", type=pathlib.Path)
     parser.add_argument("b", type=pathlib.Path)
-    parser.add_argument("--mirror-x", action="store_true", help="mirror B in X (x -> -x) before shifting")
+    parser.add_argument("--scale", type=parse_xyz, default=None, metavar="SX,SY,SZ",
+                        help="scale B per axis before shifting: -1,1,1 mirrors in X, -1,-1,1 turns it "
+                             "180 deg about Z")
     parser.add_argument("--normal-tol", type=float, default=2e-3,
                         help="per-component normal grouping tolerance for area_by_normal (default 0.002)")
     parser.add_argument("--cut", type=parse_axis_values, default=None, metavar="AXIS=V1[,V2...]",
@@ -1275,19 +1343,20 @@ def compare_main(argv):
     parser.add_argument("--shift", type=parse_xyz, default=None, metavar="X,Y,Z", help="translate B by this")
     parser.add_argument("--decimals", type=int, default=4, help="output rounding")
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
+    add_brief_option(parser)
     add_define_option(parser)
     parser.add_argument(
         "--define-b", "-Db", action="append", default=[], type=parse_define, metavar="NAME=VALUE",
         help="extra OpenSCAD variable override for B only, applied after --define "
              "(e.g. compare one .scad against itself under a different -D)",
     )
-    args = parser.parse_args(glue_vector_values(argv, {"--shift", "--window"}))
+    args = parser.parse_args(glue_vector_values(argv, {"--shift", "--window", "--scale"}))
     dec = args.decimals
 
     meshes = {
         "a": load_mesh(args.a, pathlib.Path.cwd(), args.define),
         "b": transformed(load_mesh(args.b, pathlib.Path.cwd(), args.define + args.define_b),
-                          args.shift, args.mirror_x),
+                          args.shift, args.scale),
     }
     result = {"a": str(args.a), "b": str(args.b)}
     for key, tris in meshes.items():
@@ -1322,14 +1391,54 @@ def compare_main(argv):
         mesh_normals = {key: face_normals_and_areas(tris)[0] for key, tris in meshes.items()}
         axis, values = args.slice
         result["slices"] = [compare_slice(meshes, mesh_normals, axis, value, args, dec) for value in values]
-    write_json(result, args.out)
+    if args.brief:
+        write_text(compare_lines(result, args, dec), args.out)
+    else:
+        write_json(result, args.out)
+
+
+def compare_lines(result, args, dec):
+    """compare's result as text: stats, the largest per-normal area diffs, scan diffs, slice diffs."""
+    lines = []
+    for key in "ab":
+        first, *rest = stats_lines(result[f"{key}_stats"], dec)
+        lines += [f"{key}: {first}"] + rest
+    lines.append(f"volume_diff {num(result['volume_diff'], dec)}")
+    rows = sorted((r for r in result["area_by_normal"] if abs(r["diff"]) > args.area_tol),
+                  key=lambda r: -abs(r["diff"]))
+    lines.append(f"area_by_normal: {len(rows)} normals differ by more than {args.area_tol}")
+    lines += [f"  n {vec(r['normal'], dec)} a {num(r['area_a'], dec)} b {num(r['area_b'], dec)} "
+              f"diff {num(r['diff'], dec)}" for r in rows[:args.max_diffs]]
+    for sec in result.get("sections", []):
+        cut = f"{sec['axis'].upper()}={num(sec['value'], dec)}"
+        for sa, sb, d in zip(sec["a"].get("scans", []), sec["b"].get("scans", []), sec["scan_diffs"]):
+            line = " ".join(f"{k.upper()}={num(v, dec)}" for k, v in d["line"].items())
+            if d["same_count"]:
+                lines.append(f"cut {cut} scan {line}: b-a "
+                             + (" ".join(span(x, dec) for x in d["b_minus_a"]) or "(no material)"))
+            else:
+                lines.append(f"cut {cut} scan {line}: interval counts differ: "
+                             f"a {' '.join(span(x, dec) for x in sa['intervals'])} "
+                             f"b {' '.join(span(x, dec) for x in sb['intervals'])}")
+    for sl in result.get("slices", []):
+        lines.append(f"slice {sl['axis'].upper()}={num(sl['value'], dec)}: net area a {num(sl['net_area_a'], dec)} "
+                     f"b {num(sl['net_area_b'], dec)} diff {num(sl['area_diff'], dec)} "
+                     f"loops {sl['loop_count_a']}/{sl['loop_count_b']} "
+                     f"unmatched {len(sl['unmatched_a'])}/{len(sl['unmatched_b'])}")
+        for d in sl["loop_diffs"]:
+            box = d["bounding_box"]
+            lines.append(f"  {d['kind']} u {span(box['u'], dec)} v {span(box['v'], dec)}: area a {num(d['area_a'], dec)} "
+                         f"b {num(d['area_b'], dec)} diff {num(d['diff'], dec)}")
+            lines += [f"    only_{k} {item_text(item, dec)}" for k in "ab" for item in d[f"only_{k}"]]
+        lines += [f"  only_{k} {loop_text(loop, dec)}" for k in "ab" for loop in sl[f"unmatched_{k}"]]
+    return lines
 
 
 # ---- faces (default) -------------------------------------------------------
 
 def faces_main(argv):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export with openscad first")
+    parser.add_argument("stl", type=pathlib.Path, help="STL file (binary or ASCII), or an .scad file to export with openscad first")
     parser.add_argument("--decimals", type=int, default=4, help="rounding used to merge vertices and in output")
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output JSON path (default: stdout)")
     parser.add_argument("--min-area", type=float, default=None,
@@ -1341,23 +1450,34 @@ def faces_main(argv):
     parser.add_argument("--stats", action="store_true",
                         help="only report mesh health (volume, watertight, bad edges, bounding box): "
                              "skips the face grouping, so it stays fast on large meshes")
+    add_brief_option(parser)
     add_define_option(parser)
     args = parser.parse_args(glue_vector_values(argv, {"--box"}))
 
     triangles = load_mesh(args.stl, pathlib.Path.cwd(), args.define)
+    dec = args.decimals
+    stats = {"bounding_box": bbox(triangles.reshape(-1, 3), dec), **mesh_stats(triangles, dec)}
     if args.stats:
-        write_json({"source": str(args.stl), "bounding_box": bbox(triangles.reshape(-1, 3), args.decimals),
-                    **mesh_stats(triangles, args.decimals)}, args.out)
+        if args.brief:
+            write_text(stats_lines(stats, dec), args.out)
+        else:
+            write_json({"source": str(args.stl), **stats}, args.out)
         return
     faces = extract_faces(triangles, args.decimals, args.min_area, args.box)
 
-    result = {
-        "source": str(args.stl),
-        "bounding_box": bbox(triangles.reshape(-1, 3), args.decimals),
-        **mesh_stats(triangles, args.decimals),
-        "face_count": len(faces),
-        "faces": faces,
-    }
+    if args.brief:
+        lines = stats_lines(stats, dec) + [f"{len(faces)} faces, largest first"]
+        for f in faces:
+            kinds = [loop["kind"] for loop in f["loops"]]
+            lines.append(f"{f['id']} area {num(f['area'], dec)} n {vec(f['normal'], dec)} "
+                         f"offset {num(f['plane_offset'], dec)} {bbox_text(f['bounding_box'], dec)} "
+                         f"outer {kinds.count('outer')} hole {kinds.count('hole')}")
+            holes = [np.mean(loop["points_3d"], axis=0) for loop in f["loops"] if loop["kind"] == "hole"]
+            if holes:
+                lines.append("  hole centres " + " ".join(vec(c, dec) for c in holes))
+        write_text(lines, args.out)
+        return
+    result = {"source": str(args.stl), **stats, "face_count": len(faces), "faces": faces}
     write_json(result, args.out)
     if args.out is not None:
         print(f"{len(faces)} planar faces", file=sys.stderr)

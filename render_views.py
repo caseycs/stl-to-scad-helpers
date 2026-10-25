@@ -205,7 +205,7 @@ def _render_job(job):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stl", type=pathlib.Path, help="binary STL file, or an .scad file to export with openscad first")
+    parser.add_argument("stl", type=pathlib.Path, help="STL file (binary or ASCII), or an .scad file to export with openscad first")
     parser.add_argument("--step", type=int, default=15, help="degrees between shots per axis")
     parser.add_argument("--imgsize", type=int, default=1024, help="output image size (square, px)")
     parser.add_argument("--out", type=pathlib.Path, default=None, help="output directory")
