@@ -40,8 +40,18 @@ Clone this repo into a skills directory Claude Code reads from (e.g.
 add it as a plugin marketplace/skill source. No build step: the scripts run
 as-is via `uv run`.
 
+## Tests
+
+```
+uv run --with pytest pytest tests
+```
+
+End-to-end checks on small `.scad` models with known answers (a threaded
+bore, an L-shaped block); they need `openscad`. Run them before every commit
+with the repo's hook: `git config core.hooksPath .githooks`.
+
 ## Requirements
 
 - Python ≥ 3.10, [`uv`](https://docs.astral.sh/uv/) on `PATH`.
 - [`openscad`](https://openscad.org/) on `PATH`, only if you pass a `.scad`
-  file instead of an `.stl`.
+  file instead of an `.stl`, and for the tests.

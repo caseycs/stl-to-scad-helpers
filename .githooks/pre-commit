@@ -1,0 +1,4 @@
+#!/bin/sh
+# Runs the end-to-end tests before each commit. Enable once per clone:
+#   git config core.hooksPath .githooks
+exec uv run -q --with pytest pytest -q tests
